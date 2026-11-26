@@ -1,0 +1,126 @@
+tenant_id: "tenant-acme"
+agent_id: "acme-node-01"
+# 推荐生产方式：先运行 `dataproxy-agent enroll -hub https://hub:8443 -code enroll_xxx -state-dir ./device-state`
+# 然后配置 device_state_dir（私钥仅留本机，证书自动轮换，支持单设备吊销，无需静态 token）
+device_state_dir: ""
+token: "dpx_tenant_acme_secret"
+log_level: "info"
+pool_size: 1 # 多连接并行隧道池（1..16）：>=2 时 lane 0 专跑控制面心跳/探活，其余 lane 专跑数据流，消除单 TCP 队头阻塞
+drain_timeout: 10s
+idle_timeout: 10m # 空闲数据流自动超时回收，防止僵死连接泄漏
+health_report_interval: 30s # 定时对本地服务无侵入探活并脱敏上报中心（绝不上报内网真实 IP）
+
+# 全局带宽上限（防中心拉数占满租户出口带宽），支持 KB/s、MB/s、MiB/s、Mbps
+max_bandwidth: "20MB/s"
+
+# 本地访问时间窗（可选）：仅在窗口内放行数据流，窗口外保持控制流心跳在线但物理拒绝数据读取
+timezone: "Asia/Shanghai"
+allowed_windows: [] # 示例: ["00:00-06:00", "Mon-Fri 22:00-02:00"]
+
+# 配置无损热加载轮询周期（也支持 kill -HUP <pid> 立即触发，不断开正在执行的查询）
+config_watch_interval: 3s
+
+# 租户本地结构化合规审计日志（记录中心透传的 job_type/job_id/triggered_by 访问事由与流量字节）
+audit:
+  file: ""        # 可选：如 "./logs/dataproxy-audit.jsonl"
+  syslog_addr: "" # 可选：转发企业内网 SIEM，如 "udp://siem.corp.local:514"
+
+labels:
+  env: "prod"
+  region: "cn-east"
+
+server:
+  mode: "wss" # "wss"（推荐，443/8443穿透防火墙与正向代理）或 "tls"（原生 mTLS TCP）
+  url: "wss://127.0.0.1:8443/tunnel/v1/connect"
+  proxy_url: "" # 可选：企业出向正向代理，如 "http://proxy.corp.local:3128"
+  dial_timeout: 15s
+  tls:
+    ca_file: "./certs/ca.crt"
+    cert_file: "" # 可选：启用 mTLS 时配置租户客户端证书
+    key_file: ""
+    server_name: "localhost"
+    insecure_skip_verify: false
+
+# 零信任本地服务白名单：
+# 仅此处显式声明的逻辑服务允许被中心访问，target_addr 与本地数据库凭据均不会上报给中心
+services:
+  - name: "mysql-orders"
+    protocol: "tcp"
+    target_addr: "127.0.0.1:3306"
+    description: "Orders Read-Only MySQL"
+    max_conns: 50
+    max_bandwidth: "10MB/s"
+    dial_timeout: 5s
+    # 可选：Split-TLS（适配 AWS/阿里云 RDS require_secure_transport=ON / PG force_ssl / Mongo requireTLS / Redis TLS / 内网 HTTPS）
+    # 开启后 Agent 在租户本地向目标发起加密握手，同时完整保留 L7 只读拦截与本地凭据代填能力
+    target_tls:
+      enabled: false
+      ca_file: ""              # 可选：云 RDS 根证书或企业私有 CA（PEM）
+      cert_file: ""            # 可选：内网 mTLS 客户端证书
+      key_file: ""             # 可选：内网 mTLS 客户端私钥
+      server_name: ""          # 可选：SNI / 证书域名覆盖（默认取 target_addr 的主机名）
+      insecure_skip_verify: false
+    guard:
+      type: "mysql" # 支持 mysql | postgres | mongodb | redis
+      read_only: true
+      credential_injection:
+        enabled: false
+        username: "env:MYSQL_READER_USER"
+        password: "file:/run/secrets/mysql_pass"
+
+  - name: "pg-analytics"
+    protocol: "tcp"
+    target_addr: "127.0.0.1:5432"
+    description: "Analytics PostgreSQL (SCRAM-SHA-256 凭据不出域 + 只读拦截)"
+    max_conns: 50
+    max_bandwidth: "10MB/s"
+    guard:
+      type: "postgres"
+      read_only: true
+      credential_injection:
+        enabled: false
+        username: "env:PG_READER_USER"
+        password: "file:/run/secrets/pg_pass"
+
+  - name: "mongo-catalog"
+    protocol: "tcp"
+    target_addr: "127.0.0.1:27017"
+    description: "Catalog MongoDB (OP_MSG 只读拦截 + SCRAM 凭据不出域)"
+    max_conns: 50
+    guard:
+      type: "mongodb"
+      read_only: true
+      credential_injection:
+        enabled: false
+        username: "env:MONGO_READER_USER"
+        password: "file:/run/secrets/mongo_pass"
+        auth_source: "admin"
+
+  - name: "redis-cache"
+    protocol: "tcp"
+    target_addr: "127.0.0.1:6379"
+    description: "Session Cache Redis (只读命令白名单 + 本地 AUTH)"
+    max_conns: 100
+    guard:
+      type: "redis"
+      read_only: true
+      credential_injection:
+        enabled: false
+        username: "" # Redis 6+ ACL 用户名，留空表示 default
+        password: "env:REDIS_PASSWORD"
+
+  - name: "internal-erp"
+    protocol: "http"
+    target_addr: "127.0.0.1:8000"
+    description: "Internal ERP HTTP API (Read-Only + 本地密钥代填)"
+    max_conns: 100
+    max_bandwidth: "10MB/s"
+    dial_timeout: 5s
+    allowed_http_methods:
+      - "GET"
+      - "HEAD"
+      - "OPTIONS"
+    # HTTP 内部平台密钥不出域代填（支持 env:VAR / file:/path 及 Bearer/Basic/Token 前缀）
+    inject_headers:
+      # Authorization: "Bearer env:ERP_API_TOKEN"
+      # X-API-Key: "file:/run/secrets/erp_api_key"

@@ -1,0 +1,71 @@
+log_level: "info"
+
+# Agent -> Hub 隧道接入监听
+tunnel_wss_addr: ":8443"
+tunnel_wss_path: "/tunnel/v1/connect"
+tunnel_tls_addr: ":9443" # 可选：原生 mTLS/TLS TCP 隧道端口
+
+tunnel_tls:
+  cert_file: "./certs/hub.crt"
+  key_file: "./certs/hub.key"
+  client_ca_file: "./certs/ca.crt" # 可选：启用 mTLS 客户端证书校验时配置
+  require_client_cert: false
+
+# 中心平台侧标准接入入口
+proxy_addr: "127.0.0.1:1080"             # 单端口自识别 SOCKS5 + HTTP CONNECT
+http_addr: "127.0.0.1:8080"              # 标准 HTTP/WebSocket 反向代理（支持 X-Dataproxy-Ticket）
+pg_smart_addr: "127.0.0.1:15432"         # 单端口多租户 PostgreSQL 智能票据路由（防串租户）
+mysql_smart_addr: "127.0.0.1:13306"      # 单端口多租户 MySQL 智能票据路由（防串租户）
+mongo_smart_addr: "127.0.0.1:17017"      # 单端口多租户 MongoDB 智能票据路由（SASL PLAIN 防串租户）
+redis_smart_addr: "127.0.0.1:16379"      # 单端口多租户 Redis 智能票据路由（防串租户）
+virtual_domain_suffix: "dataproxy.internal"
+
+# 管控、持久化、集群 Mesh、观测、短效票据与设备 PKI（一次性挂载码 + 短期设备证书签发）
+state_file: "./data/hub-state.json"      # 控制面崩溃安全持久化（设备 CA/已注册设备/吊销黑名单/动态租户与端口绑定）
+node_id: "hub-node-1"                    # 多节点高可用 Hub 集群节点标识
+mesh_listen_addr: ""                     # 可选：集群内 Hub-to-Hub 透明转发监听，如 ":7946"
+mesh_secret: ""                          # 集群内部 Mesh 鉴权密钥（多节点一致）
+mesh_peers: []                           # 对端 Hub Mesh 地址列表，如 ["10.0.0.12:7946"]
+admin_addr: "127.0.0.1:9090"
+admin_token: "dpx_admin_change_me"
+ticket_signing_key: "dpx_ticket_hmac_secret_change_me" # 多节点共享以支持 MySQL/PG/Mongo/Redis/HTTP 无状态跨节点验票
+ticket_default_ttl: 5m
+device_cert_ttl: 168h                    # 短期设备证书有效期（默认 7 天，客户端自动轮换）
+enrollment_ttl: 15m                      # 一次性挂载码有效期（默认 15 分钟，用完即焚）
+heartbeat_interval: 15s
+stream_open_timeout: 10s
+
+# 吵闹邻居隔离与公网握手防 DoS 保护
+max_streams_per_tenant: 500              # 单租户在 Hub 侧最大并发数据流（0 表示不限）
+max_sessions_per_tenant: 32              # 单租户最大并发隧道连接数（含多连接池通道）
+handshake_rate_limit_per_min: 120        # /tunnel/v1/* 公网入口单 IP 每分钟握手/注册令牌数
+handshake_burst: 30                      # 单 IP 突发令牌桶容量
+
+# 生产环境保持 false，要求中心调用方携带凭据并通过租户级 ACL 校验
+allow_unauthenticated_callers: false
+
+# 已注册的租户凭据（token 支持明文或 sha256:<hex> 摘要）
+tenants:
+  - tenant_id: "tenant-acme"
+    token: "dpx_tenant_acme_secret"
+    require_mtls: false
+
+# 中心侧调用方 ACL（用于 SOCKS5 / HTTP CONNECT / HTTP 反向代理鉴权）
+callers:
+  - caller_id: "data-sync-platform"
+    secret: "dpx_caller_platform_secret"
+    allowed_tenants: ["*"]
+    allowed_services: ["*"]
+  - caller_id: "acme-bi-worker"
+    secret: "dpx_caller_acme_secret"
+    allowed_tenants: ["tenant-acme"]
+    allowed_services: ["mysql-orders", "internal-erp"]
+
+# 静态 TCP 端口映射（中心业务零改造直连，也可通过 Admin API 动态按需分配）
+tcp_bindings:
+  - id: "acme-mysql-orders"
+    listen_addr: "127.0.0.1:23306"
+    tenant_id: "tenant-acme"
+    service_name: "mysql-orders"
+    allowed_cidrs:
+      - "127.0.0.0/8"

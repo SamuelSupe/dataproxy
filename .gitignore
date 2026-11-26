@@ -1,0 +1,22 @@
+# Build & release outputs
+bin/
+dist/
+
+# Generated local certs, state files, logs & secrets
+certs/
+data/
+device-state/
+logs/
+*.jsonl
+*.key
+*.crt
+*.pem
+*.csr
+*.srl
+*.tmp
+
+# OS & IDE files
+.DS_Store
+.idea/
+.vscode/
+*.swp
