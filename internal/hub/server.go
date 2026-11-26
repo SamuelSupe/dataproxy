@@ -38,6 +38,7 @@ type Server struct {
 
 	wssLn        net.Listener
 	wssSrv       *http.Server
+	quicLn       *transport.QUICListener
 	rawTLSLn     net.Listener
 	meshLn       net.Listener
 	proxyLn      net.Listener
@@ -47,10 +48,13 @@ type Server struct {
 	mysqlSmartLn net.Listener
 	mongoSmartLn net.Listener
 	redisSmartLn net.Listener
-	adminLn      net.Listener
-	adminSrv     *http.Server
-	wg           sync.WaitGroup
-	closeOnce    sync.Once
+	adminLn           net.Listener
+	adminSrv          *http.Server
+	stopSyncCh        chan struct{}
+	lastSyncWatermark string
+	syncMu            sync.Mutex
+	wg                sync.WaitGroup
+	closeOnce         sync.Once
 }
 
 // NewServer constructs a hub server from cfg.
@@ -61,7 +65,13 @@ func NewServer(cfg *Config, logger *slog.Logger) (*Server, error) {
 	}
 
 	var st store.Store
-	if cfg.StateFile != "" {
+	if cfg.StoreMySQLDSN != "" {
+		ms, err := store.NewMySQLStore(cfg.StoreMySQLDSN)
+		if err != nil {
+			return nil, fmt.Errorf("init hub mysql cluster store: %w", err)
+		}
+		st = ms
+	} else if cfg.StateFile != "" {
 		fs, err := store.NewFileStore(cfg.StateFile)
 		if err != nil {
 			return nil, fmt.Errorf("init hub state store: %w", err)
@@ -133,7 +143,85 @@ func NewServer(cfg *Config, logger *slog.Logger) (*Server, error) {
 		httpIngress:  httpIng,
 		smartDB:      smartDB,
 		adminAPI:     adminAPI,
+		stopSyncCh:   make(chan struct{}),
 	}, nil
+}
+
+type watermarkClusterStore interface {
+	ClusterWatermark() (string, error)
+}
+
+// SyncClusterNow pulls the latest devices, revocations, and tenant records from the shared
+// ClusterStore (MySQL) and immediately kicks any active sessions belonging to revoked devices
+// or disabled/deleted tenants. Uses a lightweight O(1) watermark check when supported to skip
+// full table loads and write locks during steady-state polling.
+func (s *Server) SyncClusterNow() error {
+	cs, ok := s.st.(store.ClusterStore)
+	if !ok {
+		return nil
+	}
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
+	var newWatermark string
+	if wcs, hasWM := s.st.(watermarkClusterStore); hasWM {
+		wm, err := wcs.ClusterWatermark()
+		if err != nil {
+			return err
+		}
+		if wm != "" && wm == s.lastSyncWatermark {
+			return nil
+		}
+		newWatermark = wm
+	}
+
+	devices, tenants, err := cs.LoadClusterSync()
+	if err != nil {
+		return err
+	}
+	if s.devices != nil {
+		for _, devID := range s.devices.SyncDevices(devices) {
+			if closed := s.registry.CloseDeviceSessions(devID); closed > 0 {
+				s.logger.Warn("AUDIT: kicked active session(s) for cluster-revoked device",
+					"device_id", devID,
+					"closed_sessions", closed,
+				)
+			}
+		}
+	}
+	if s.tenantAuth != nil {
+		for _, tid := range s.tenantAuth.SyncTenants(tenants) {
+			if closed := s.registry.CloseTenantSessions(tid); closed > 0 {
+				s.logger.Warn("AUDIT: kicked active session(s) for cluster-disabled/deleted tenant",
+					"tenant_id", tid,
+					"closed_sessions", closed,
+				)
+			}
+		}
+	}
+	if newWatermark != "" {
+		s.lastSyncWatermark = newWatermark
+	}
+	return nil
+}
+
+func (s *Server) runClusterSyncLoop() {
+	interval := s.cfg.StoreSyncInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopSyncCh:
+			return
+		case <-ticker.C:
+			if err := s.SyncClusterNow(); err != nil {
+				s.logger.Warn("cluster store sync failed", "error", err)
+			}
+		}
+	}
 }
 
 // Metrics returns the hub's Prometheus metrics collector.
@@ -197,6 +285,14 @@ func (s *Server) WSSAddr() string {
 		return ""
 	}
 	return s.wssLn.Addr().String()
+}
+
+// QUICAddr returns the bound UDP address of the native QUIC tunnel listener, if enabled.
+func (s *Server) QUICAddr() string {
+	if s.quicLn == nil {
+		return ""
+	}
+	return s.quicLn.Addr().String()
 }
 
 // RawTLSAddr returns the bound address of the raw TLS/TCP tunnel listener, if enabled.
@@ -264,13 +360,40 @@ func (s *Server) Start() error {
 		mux.HandleFunc(s.cfg.TunnelWSSPath, s.tunnelServer.HandleWebSocket)
 		mux.HandleFunc("/tunnel/v1/enroll", s.tunnelServer.HandleDeviceEnroll)
 		mux.HandleFunc("/tunnel/v1/renew", s.tunnelServer.HandleDeviceRenew)
-		s.wssSrv = &http.Server{Handler: mux, ReadHeaderTimeout: 15 * time.Second}
+		s.wssSrv = &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+		}
 		s.logger.Info("tunnel WSS listener started", "addr", s.wssLn.Addr().String(), "path", s.cfg.TunnelWSSPath, "tls", tlsCfg != nil)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			if err := s.wssSrv.Serve(s.wssLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("tunnel WSS server stopped", "error", err)
+			}
+		}()
+	}
+
+	// 1.5 Optional Native QUIC (UDP + TLS 1.3) Tunnel Listener.
+	if s.cfg.TunnelQUICAddr != "" {
+		if tlsCfg == nil {
+			s.Close()
+			return fmt.Errorf("listen tunnel_quic_addr %s: tunnel_tls cert_file and key_file are required for QUIC", s.cfg.TunnelQUICAddr)
+		}
+		qln, err := transport.ListenQUIC(s.cfg.TunnelQUICAddr, tlsCfg)
+		if err != nil {
+			s.Close()
+			return fmt.Errorf("listen tunnel_quic_addr %s: %w", s.cfg.TunnelQUICAddr, err)
+		}
+		s.quicLn = qln
+		s.logger.Info("tunnel QUIC listener started", "addr", qln.Addr().String(), "alpn", transport.QUICALPN)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.tunnelServer.ServeQUIC(qln); err != nil {
+				s.logger.Error("tunnel QUIC listener stopped", "error", err)
 			}
 		}()
 	}
@@ -325,7 +448,12 @@ func (s *Server) Start() error {
 			return fmt.Errorf("listen http_addr %s: %w", s.cfg.HTTPAddr, err)
 		}
 		s.httpLn = ln
-		s.httpSrv = &http.Server{Handler: s.httpIngress, ReadHeaderTimeout: 30 * time.Second}
+		s.httpSrv = &http.Server{
+			Handler:           s.httpIngress,
+			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+		}
 		s.logger.Info("HTTP reverse proxy ingress started", "addr", ln.Addr().String(), "suffix", s.cfg.VirtualDomainSuffix)
 		s.wg.Add(1)
 		go func() {
@@ -420,7 +548,12 @@ func (s *Server) Start() error {
 			return fmt.Errorf("listen admin_addr %s: %w", s.cfg.AdminAddr, err)
 		}
 		s.adminLn = ln
-		s.adminSrv = &http.Server{Handler: s.adminAPI, ReadHeaderTimeout: 15 * time.Second}
+		s.adminSrv = &http.Server{
+			Handler:           s.adminAPI,
+			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+		}
 		s.logger.Info("admin API listener started", "addr", ln.Addr().String())
 		s.wg.Add(1)
 		go func() {
@@ -440,16 +573,33 @@ func (s *Server) Start() error {
 	}
 	s.portMapper.RestorePersisted()
 
+	// 9. Start real-time cluster state & revocation sync loop when backed by shared MySQL ClusterStore.
+	if _, ok := s.st.(store.ClusterStore); ok {
+		s.logger.Info("shared cluster store sync started", "interval", s.cfg.StoreSyncInterval.String())
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runClusterSyncLoop()
+		}()
+	}
+
 	return nil
 }
 
 // Close gracefully stops all hub listeners and active bindings.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		close(s.stopSyncCh)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
+		// Close active agent tunnel sessions and idle proxy pools first so any in-flight
+		// HTTP/TCP proxy streams unwind immediately rather than stalling Shutdown.
 		s.portMapper.Close()
+		s.registry.CloseAll()
+		if s.httpIngress != nil {
+			s.httpIngress.CloseIdleConnections()
+		}
 		if s.adminSrv != nil {
 			_ = s.adminSrv.Shutdown(ctx)
 		}
@@ -477,10 +627,12 @@ func (s *Server) Close() {
 		if s.rawTLSLn != nil {
 			_ = s.rawTLSLn.Close()
 		}
+		if s.quicLn != nil {
+			_ = s.quicLn.Close()
+		}
 		if s.wssSrv != nil {
 			_ = s.wssSrv.Shutdown(ctx)
 		}
-		s.registry.CloseAll()
 		s.wg.Wait()
 		if s.st != nil {
 			_ = s.st.Close()

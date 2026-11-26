@@ -43,6 +43,15 @@ type PersistedBinding struct {
 	AllowedCIDRs []string `json:"allowed_cidrs,omitempty"`
 }
 
+// PersistedEnrollment stores a single-use device enrollment code shared across Hub cluster nodes.
+type PersistedEnrollment struct {
+	Code       string    `json:"code"`
+	TenantID   string    `json:"tenant_id"`
+	DeviceName string    `json:"device_name,omitempty"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Used       bool      `json:"used"`
+}
+
 // Snapshot is the complete control-plane state persisted by a Store implementation.
 type Snapshot struct {
 	DeviceCACertPEM string                      `json:"device_ca_cert_pem,omitempty"`
@@ -52,8 +61,7 @@ type Snapshot struct {
 	Bindings        map[string]PersistedBinding `json:"bindings,omitempty"`
 }
 
-// Store abstracts control-plane persistence (default: atomic JSON FileStore;
-// pluggable for PostgreSQL / Etcd / SQLite in large clusters).
+// Store abstracts control-plane persistence (FileStore for single-node, MySQLStore for HA clusters).
 type Store interface {
 	Load() (*Snapshot, error)
 	SaveDeviceCA(certPEM, keyPEM string) error
@@ -63,6 +71,18 @@ type Store interface {
 	SaveBinding(b PersistedBinding) error
 	DeleteBinding(id string) error
 	Close() error
+}
+
+// ClusterStore is an optional extension of Store implemented by shared databases (e.g. MySQLStore)
+// to support multi-node HA Hub clusters: atomic Device CA bootstrap, cross-node single-use
+// enrollment codes, zero-lag read-through device/revocation checks, and real-time cluster sync.
+type ClusterStore interface {
+	Store
+	SaveDeviceCAIfAbsent(certPEM, keyPEM string) (finalCertPEM, finalKeyPEM string, err error)
+	GetDevice(deviceID string) (*PersistedDevice, error)
+	SaveEnrollment(e PersistedEnrollment) error
+	ConsumeEnrollment(code string) (*PersistedEnrollment, error)
+	LoadClusterSync() (devices []PersistedDevice, tenants []PersistedTenant, err error)
 }
 
 // FileStore is a zero-dependency crash-safe JSON file Store using atomic write-temp + rename.

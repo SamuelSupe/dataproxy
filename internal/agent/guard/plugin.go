@@ -127,6 +127,44 @@ func init() {
 		}
 		return &httpGuardAdapter{g: g}, nil
 	})
+
+	RegisterGuardFactory("mssql", func(spec GuardSpec) (ProtocolGuard, error) {
+		cfg := MSSQLGuardConfig{
+			ReadOnly:     spec.ReadOnly,
+			InjectCreds:  spec.InjectCreds,
+			UsernameSpec: spec.UsernameSpec,
+			PasswordSpec: spec.PasswordSpec,
+			TargetTLS:    spec.TargetTLS,
+		}
+		if !cfg.Enabled() {
+			return nil, nil
+		}
+		return &mssqlGuardAdapter{p: NewMSSQLProxy(cfg)}, nil
+	})
+
+	RegisterGuardFactory("oracle", func(spec GuardSpec) (ProtocolGuard, error) {
+		cfg := OracleGuardConfig{
+			ReadOnly:  spec.ReadOnly,
+			TargetTLS: spec.TargetTLS,
+		}
+		if !cfg.Enabled() {
+			return nil, nil
+		}
+		return &oracleGuardAdapter{p: NewOracleProxy(cfg)}, nil
+	})
+
+	RegisterGuardFactory("clickhouse", func(spec GuardSpec) (ProtocolGuard, error) {
+		cfg := ClickHouseGuardConfig{
+			ReadOnly:     spec.ReadOnly,
+			InjectCreds:  spec.InjectCreds,
+			UsernameSpec: spec.UsernameSpec,
+			PasswordSpec: spec.PasswordSpec,
+		}
+		if !cfg.Enabled() {
+			return nil, nil
+		}
+		return &clickhouseGuardAdapter{p: NewClickHouseProxy(cfg)}, nil
+	})
 }
 
 type mysqlGuardAdapter struct{ p *MySQLProxy }
@@ -188,4 +226,40 @@ func (a *httpGuardAdapter) Proxy(c, u net.Conn, onBlocked BlockCallback) (int64,
 		}
 	})
 	return inB, outB, nil
+}
+
+type mssqlGuardAdapter struct{ p *MSSQLProxy }
+
+func (a *mssqlGuardAdapter) Type() string        { return "mssql" }
+func (a *mssqlGuardAdapter) BlockedCount() int64 { return a.p.BlockedQueries() }
+func (a *mssqlGuardAdapter) Proxy(c, u net.Conn, onBlocked BlockCallback) (int64, int64, error) {
+	return a.p.Proxy(c, u, func(action, reason string) {
+		if onBlocked != nil {
+			onBlocked("mssql", action, reason)
+		}
+	})
+}
+
+type oracleGuardAdapter struct{ p *OracleProxy }
+
+func (a *oracleGuardAdapter) Type() string        { return "oracle" }
+func (a *oracleGuardAdapter) BlockedCount() int64 { return a.p.BlockedQueries() }
+func (a *oracleGuardAdapter) Proxy(c, u net.Conn, onBlocked BlockCallback) (int64, int64, error) {
+	return a.p.Proxy(c, u, func(sqlText, reason string) {
+		if onBlocked != nil {
+			onBlocked("oracle", sqlText, reason)
+		}
+	})
+}
+
+type clickhouseGuardAdapter struct{ p *ClickHouseProxy }
+
+func (a *clickhouseGuardAdapter) Type() string        { return "clickhouse" }
+func (a *clickhouseGuardAdapter) BlockedCount() int64 { return a.p.BlockedQueries() }
+func (a *clickhouseGuardAdapter) Proxy(c, u net.Conn, onBlocked BlockCallback) (int64, int64, error) {
+	return a.p.Proxy(c, u, func(sqlText, reason string) {
+		if onBlocked != nil {
+			onBlocked("clickhouse", sqlText, reason)
+		}
+	})
 }

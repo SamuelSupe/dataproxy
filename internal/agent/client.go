@@ -17,8 +17,6 @@ import (
 
 	"dataproxy/internal/transport"
 	"dataproxy/pkg/protocol"
-
-	"github.com/hashicorp/yamux"
 )
 
 // Client is the tenant-side dataproxy-agent runtime supporting multi-lane tunnel pools
@@ -35,7 +33,7 @@ type Client struct {
 	whitelist     *Whitelist
 	logger        *slog.Logger
 	activeStreams atomic.Int64
-	streamWG      sync.WaitGroup
+	streamZeroCh  chan struct{}
 
 	readyOnce sync.Once
 	readyCh   chan struct{}
@@ -62,6 +60,7 @@ func NewClient(cfg *Config, logger *slog.Logger) (*Client, error) {
 		audit:           auditLogger,
 		activeCtrlMap:   make(map[int]func(uint8, any) error),
 		logger:          baseLogger,
+		streamZeroCh:    make(chan struct{}, 1),
 		readyCh:         make(chan struct{}),
 	}, nil
 }
@@ -299,38 +298,48 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 	cfgSnap := c.cfg
 	c.mu.RUnlock()
 
-	c.logger.Info("dialing hub tunnel", "mode", cfgSnap.Server.Mode, "url", cfgSnap.Server.URL, "lane", lane, "role", role)
-	// Abort an in-flight Hub dial immediately if parentCtx is canceled, while keeping
-	// sessionCtx alive after connect so websocket.NetConn stays open during graceful drain.
-	dialDone := make(chan struct{})
+	c.logger.Info("dialing hub tunnel", "mode", cfgSnap.Server.Mode, "url", cfgSnap.Server.URL, "quic_url", cfgSnap.Server.QUICURL, "lane", lane, "role", role)
+	// Abort an in-flight Hub dial OR registration handshake immediately if parentCtx is canceled,
+	// while keeping sessionCtx alive after registration so websocket.NetConn / QUIC stay open during graceful drain.
+	initDone := make(chan struct{})
+	var closeInitOnce sync.Once
+	stopInitWatcher := func() { closeInitOnce.Do(func() { close(initDone) }) }
+	defer stopInitWatcher()
+
+	var muxMu sync.Mutex
+	var activeMux transport.StreamMux
 	go func() {
 		select {
 		case <-parentCtx.Done():
 			cancelSession()
-		case <-dialDone:
+			muxMu.Lock()
+			m := activeMux
+			muxMu.Unlock()
+			if m != nil {
+				_ = m.Close()
+			}
+		case <-initDone:
 		}
 	}()
-	conn, err := transport.DialTunnel(sessionCtx, transport.DialConfig{
+	muxSession, activeTransport, err := transport.DialTunnelMux(sessionCtx, transport.DialConfig{
 		Mode:        cfgSnap.Server.Mode,
 		URL:         cfgSnap.Server.URL,
+		QUICURL:     cfgSnap.Server.QUICURL,
 		ProxyURL:    cfgSnap.Server.ProxyURL,
 		DialTimeout: cfgSnap.Server.DialTimeout,
 		TLS:         cfgSnap.Server.TLS,
 	})
-	close(dialDone)
 	if err != nil {
 		return err
 	}
-
-	muxSession, err := yamux.Client(conn, transport.DefaultYamuxConfig())
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("init yamux client: %w", err)
-	}
-	defer func() {
+	muxMu.Lock()
+	activeMux = muxSession
+	muxMu.Unlock()
+	if parentCtx.Err() != nil {
 		_ = muxSession.Close()
-		_ = conn.Close()
-	}()
+		return parentCtx.Err()
+	}
+	defer func() { _ = muxSession.Close() }()
 
 	ctrlStream, err := muxSession.OpenStream()
 	if err != nil {
@@ -376,6 +385,7 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 
 	c.logger.Info("registered with hub successfully",
 		"session_id", regResp.SessionID,
+		"transport", activeTransport,
 		"lane", lane,
 		"role", role,
 		"services", len(regReq.Services),
@@ -389,6 +399,8 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 	writeCtrl := func(frameType uint8, msg any) error {
 		ctrlWriteMu.Lock()
 		defer ctrlWriteMu.Unlock()
+		_ = ctrlStream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		defer func() { _ = ctrlStream.SetWriteDeadline(time.Time{}) }()
 		return protocol.WriteFrame(ctrlStream, frameType, msg)
 	}
 
@@ -401,21 +413,16 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 		c.mu.Unlock()
 	}()
 
+	// Registration succeeded: hand off shutdown lifecycle from initWatcher to graceful drain watcher.
+	stopInitWatcher()
+
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		select {
 		case <-parentCtx.Done():
 			_ = writeCtrl(protocol.FrameDrain, protocol.DrainMessage{Reason: "agent_shutdown"})
-			drained := make(chan struct{})
-			go func() {
-				c.streamWG.Wait()
-				close(drained)
-			}()
-			select {
-			case <-drained:
-			case <-time.After(drainTimeout):
-			}
+			c.waitDrain(sessionCtx, drainTimeout)
 			_ = muxSession.Close()
 			cancelSession()
 		case <-sessionCtx.Done():
@@ -439,11 +446,16 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 				acceptErrCh <- err
 				return
 			}
-			c.streamWG.Add(1)
 			c.activeStreams.Add(1)
 			go func(s net.Conn) {
-				defer c.streamWG.Done()
-				defer c.activeStreams.Add(-1)
+				defer func() {
+					if c.activeStreams.Add(-1) == 0 {
+						select {
+						case c.streamZeroCh <- struct{}{}:
+						default:
+						}
+					}
+				}()
 				c.handleDataStream(s)
 			}(stream)
 		}
@@ -459,6 +471,34 @@ func (c *Client) runSession(parentCtx context.Context, lane int, role string) er
 	_ = muxSession.Close()
 	<-shutdownDone
 	return exitErr
+}
+
+// waitDrain waits until activeStreams drops to zero, sessionCtx ends (tunnel died), or timeout elapses
+// without racing WaitGroup.Add/Wait or leaking waiter goroutines across multi-lane pools.
+func (c *Client) waitDrain(sessionCtx context.Context, timeout time.Duration) {
+	if c.activeStreams.Load() == 0 || timeout <= 0 {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if c.activeStreams.Load() == 0 {
+			return
+		}
+		select {
+		case <-c.streamZeroCh:
+			if c.activeStreams.Load() == 0 {
+				return
+			}
+		case <-sessionCtx.Done():
+			return
+		case <-ticker.C:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 func (c *Client) runControlHeartbeat(

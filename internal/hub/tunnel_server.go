@@ -18,7 +18,29 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
+	"github.com/quic-go/quic-go"
 )
+
+const (
+	maxPublicControlBodyBytes = 64 * 1024
+	ctrlStreamWriteTimeout    = 10 * time.Second
+)
+
+var ctrlStreamAcceptTimeout = 15 * time.Second
+
+// sleepAcceptBackoff backs off exponentially (5ms -> 1s) on transient listener Accept errors
+// (such as temporary EMFILE/ENFILE bursts) instead of killing the listener or spinning at 100% CPU.
+func sleepAcceptBackoff(delay *time.Duration) {
+	if *delay == 0 {
+		*delay = 5 * time.Millisecond
+	} else {
+		*delay *= 2
+		if *delay > time.Second {
+			*delay = time.Second
+		}
+	}
+	time.Sleep(*delay)
+}
 
 // TunnelServer accepts outbound agent tunnel connections over WSS and/or raw TLS/TCP,
 // and serves one-time device enrollment & automatic certificate renewal endpoints on the same HTTPS port.
@@ -94,8 +116,9 @@ func (ts *TunnelServer) HandleDeviceEnroll(w http.ResponseWriter, r *http.Reques
 		Code   string `json:"code"`
 		CSRPEM string `json:"csr_pem"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPublicControlBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	bundle, err := ts.devices.CompleteEnrollment(req.Code, req.CSRPEM)
@@ -131,8 +154,9 @@ func (ts *TunnelServer) HandleDeviceRenew(w http.ResponseWriter, r *http.Request
 		DeviceToken string `json:"device_token"`
 		CSRPEM      string `json:"csr_pem"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxPublicControlBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	var peerCerts []*x509.Certificate
@@ -186,48 +210,107 @@ func (ts *TunnelServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 // ServeRawListener accepts raw TLS or TCP agent tunnel connections on ln.
 func (ts *TunnelServer) ServeRawListener(ln net.Listener, transportName string) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			ts.logger.Warn("raw tunnel accept error, backing off", "transport", transportName, "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
-		go func(c net.Conn) {
+		tempDelay = 0
+		remoteAddr := conn.RemoteAddr().String()
+		if ts.limiter != nil && !ts.limiter.Allow(remoteAddr) {
+			if ts.metrics != nil {
+				ts.metrics.RateLimitedHandshakes.Add(1)
+			}
+			ts.logger.Warn("AUDIT: raw tunnel handshake rate limited", "transport", transportName, "remote_addr", remoteAddr)
+			_ = conn.Close()
+			continue
+		}
+		go func(c net.Conn, remote string) {
+			defer func() {
+				if r := recover(); r != nil {
+					ts.logger.Error("recovered panic in raw tunnel handshake", "remote_addr", remote, "panic", r)
+					_ = c.Close()
+				}
+			}()
 			var peerCerts []*x509.Certificate
 			if tc, ok := c.(*tls.Conn); ok {
 				_ = tc.SetDeadline(time.Now().Add(15 * time.Second))
 				if err := tc.Handshake(); err != nil {
-					ts.logger.Warn("tls handshake failed", "remote_addr", c.RemoteAddr(), "error", err)
+					ts.logger.Warn("tls handshake failed", "remote_addr", remote, "error", err)
 					_ = c.Close()
 					return
 				}
 				_ = tc.SetDeadline(time.Time{})
 				peerCerts = tc.ConnectionState().PeerCertificates
 			}
-			ts.serveTunnelConn(c, c.RemoteAddr().String(), transportName, peerCerts)
-		}(conn)
+			ts.serveTunnelConn(c, remote, transportName, peerCerts)
+		}(conn, remoteAddr)
+	}
+}
+
+// ServeQUIC accepts native QUIC (UDP + TLS 1.3) agent tunnel connections on ln.
+// Native QUIC streams replace Yamux completely, eliminating transport Head-of-Line blocking.
+func (ts *TunnelServer) ServeQUIC(ln *transport.QUICListener) error {
+	var tempDelay time.Duration
+	for {
+		qconn, err := ln.Accept(context.Background())
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, quic.ErrServerClosed) {
+				return nil
+			}
+			ts.logger.Warn("quic tunnel accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
+		}
+		tempDelay = 0
+		remoteAddr := qconn.RemoteAddr().String()
+		if ts.limiter != nil && !ts.limiter.Allow(remoteAddr) {
+			if ts.metrics != nil {
+				ts.metrics.RateLimitedHandshakes.Add(1)
+			}
+			ts.logger.Warn("AUDIT: quic tunnel handshake rate limited", "remote_addr", remoteAddr)
+			_ = qconn.CloseWithError(429, "rate limit exceeded")
+			continue
+		}
+		go func(qc *quic.Conn, remote string) {
+			peerCerts := qc.ConnectionState().TLS.PeerCertificates
+			ts.serveTunnelMux(transport.NewQUICMux(qc), remote, "quic", peerCerts)
+		}(qconn, remoteAddr)
 	}
 }
 
 func (ts *TunnelServer) serveTunnelConn(conn net.Conn, remoteAddr, transportName string, peerCerts []*x509.Certificate) {
+	muxSession, err := yamux.Server(conn, transport.DefaultYamuxConfig())
+	if err != nil {
+		ts.logger.Warn("init yamux server failed", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
+		return
+	}
+	ts.serveTunnelMux(transport.NewYamuxMux(muxSession, conn), remoteAddr, transportName, peerCerts)
+}
+
+func (ts *TunnelServer) serveTunnelMux(muxSession transport.StreamMux, remoteAddr, transportName string, peerCerts []*x509.Certificate) {
 	defer func() {
 		if r := recover(); r != nil {
 			ts.logger.Error("recovered panic in tunnel session handler", "remote_addr", remoteAddr, "panic", r)
 		}
-		_ = conn.Close()
+		_ = muxSession.Close()
 	}()
 
-	muxSession, err := yamux.Server(conn, transport.DefaultYamuxConfig())
-	if err != nil {
-		ts.logger.Warn("init yamux server failed", "remote_addr", remoteAddr, "error", err)
-		return
-	}
-	defer func() { _ = muxSession.Close() }()
-
-	// Accept Control Stream #1 from agent.
+	// Accept Control Stream #1 from agent with a strict pre-auth timeout so an idle
+	// client that completes WSS/QUIC/TLS handshake without opening Stream #1 cannot
+	// hold goroutines or sockets indefinitely (Slowloris defense).
+	acceptTimer := time.AfterFunc(ctrlStreamAcceptTimeout, func() {
+		_ = muxSession.Close()
+	})
 	ctrlStream, err := muxSession.AcceptStream()
+	acceptTimer.Stop()
 	if err != nil {
 		ts.logger.Warn("failed accepting agent control stream", "remote_addr", remoteAddr, "error", err)
 		return
@@ -349,9 +432,12 @@ func (ts *TunnelServer) serveTunnelConn(conn net.Conn, remoteAddr, transportName
 		case protocol.FramePing:
 			var ping protocol.PingMessage
 			_ = json.Unmarshal(frame.Payload, &ping)
-			if err := protocol.WriteFrame(ctrlStream, protocol.FramePong, protocol.PongMessage{
+			_ = ctrlStream.SetWriteDeadline(time.Now().Add(ctrlStreamWriteTimeout))
+			werr := protocol.WriteFrame(ctrlStream, protocol.FramePong, protocol.PongMessage{
 				SentAtUnixNano: ping.SentAtUnixNano,
-			}); err != nil {
+			})
+			_ = ctrlStream.SetWriteDeadline(time.Time{})
+			if werr != nil {
 				return
 			}
 			var rtt time.Duration

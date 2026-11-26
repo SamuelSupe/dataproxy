@@ -30,9 +30,10 @@ labels:
   region: "cn-east"
 
 server:
-  mode: "wss" # "wss"（推荐，443/8443穿透防火墙与正向代理）或 "tls"（原生 mTLS TCP）
+  mode: "wss" # "wss"（默认推荐，100% 穿透企业代理）| "quic"（原生 QUIC UDP，弱网零队头阻塞）| "auto"（优先 QUIC，不通自动回退 WSS）| "tls"
   url: "wss://127.0.0.1:8443/tunnel/v1/connect"
-  proxy_url: "" # 可选：企业出向正向代理，如 "http://proxy.corp.local:3128"
+  quic_url: "" # 可选：mode 为 quic/auto 时自定义 QUIC UDP 地址（留空自动复用 url 的 host:port）
+  proxy_url: "" # 可选：企业出向正向代理，如 "http://proxy.corp.local:3128"（auto 模式下检测到代理将直接走 wss）
   dial_timeout: 15s
   tls:
     ca_file: "./certs/ca.crt"
@@ -61,7 +62,7 @@ services:
       server_name: ""          # 可选：SNI / 证书域名覆盖（默认取 target_addr 的主机名）
       insecure_skip_verify: false
     guard:
-      type: "mysql" # 支持 mysql | postgres | mongodb | redis
+      type: "mysql" # 支持 mysql | doris | starrocks | postgres | mongodb | redis | mssql | oracle | clickhouse
       read_only: true
       credential_injection:
         enabled: false
@@ -124,3 +125,36 @@ services:
     inject_headers:
       # Authorization: "Bearer env:ERP_API_TOKEN"
       # X-API-Key: "file:/run/secrets/erp_api_key"
+
+  # 企业政企/ERP/数仓协议示例（按需取消注释启用）：
+  # - name: "erp-sqlserver"
+  #   protocol: "tcp"
+  #   target_addr: "10.0.1.30:1433"
+  #   description: "ERP SQL Server (MS-TDS 只读拦截 + LOGIN7 本地凭据代填)"
+  #   guard:
+  #     type: "mssql"
+  #     read_only: true
+  #     credential_injection:
+  #       enabled: true
+  #       username: "env:MSSQL_READER_USER"
+  #       password: "file:/run/secrets/mssql_pass"
+  #
+  # - name: "core-oracle"
+  #   protocol: "tcp"
+  #   target_addr: "10.0.1.31:1521"
+  #   description: "Core Oracle DB (TNS/TTC SQL 只读拦截)"
+  #   guard:
+  #     type: "oracle"
+  #     read_only: true
+  #
+  # - name: "olap-clickhouse"
+  #   protocol: "tcp" # 自动兼容 ClickHouse HTTP(8123/8443) 与 Native TCP(9000/9440)
+  #   target_addr: "10.0.1.32:8123"
+  #   description: "OLAP ClickHouse (只读拦截 + readonly=1 + 本地凭据代填)"
+  #   guard:
+  #     type: "clickhouse"
+  #     read_only: true
+  #     credential_injection:
+  #       enabled: true
+  #       username: "env:CH_READER_USER"
+  #       password: "file:/run/secrets/ch_pass"

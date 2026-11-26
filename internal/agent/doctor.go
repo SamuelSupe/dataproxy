@@ -18,8 +18,6 @@ import (
 	"dataproxy/internal/agent/guard"
 	"dataproxy/internal/transport"
 	"dataproxy/pkg/protocol"
-
-	"github.com/hashicorp/yamux"
 )
 
 // CheckStatus represents the outcome of a single diagnostic item.
@@ -231,15 +229,19 @@ func checkHubTunnelHandshake(ctx context.Context, cfg *Config) CheckResult {
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	conn, err := transport.DialTunnel(dialCtx, transport.DialConfig{
+	mux, activeTransport, err := transport.DialTunnelMux(dialCtx, transport.DialConfig{
 		Mode:        cfg.Server.Mode,
 		URL:         cfg.Server.URL,
+		QUICURL:     cfg.Server.QUICURL,
 		ProxyURL:    cfg.Server.ProxyURL,
 		DialTimeout: 5 * time.Second,
 		TLS:         cfg.Server.TLS,
 	})
 	if err != nil {
 		advice := "请检查中心 Hub 地址是否可达、防火墙是否放行 443/目标出向端口；若企业内网需走代理，请配置 server.proxy_url。"
+		if strings.EqualFold(cfg.Server.Mode, "quic") {
+			advice = "QUIC (UDP) 建连失败：企业出向防火墙可能拦截了 UDP 端口或目标 Hub 未开启 tunnel_quic_addr。建议改用 server.mode: \"auto\"（QUIC 不通自动回退 WSS）或 \"wss\"。"
+		}
 		var unknownAuth x509.UnknownAuthorityError
 		if errors.As(err, &unknownAuth) || strings.Contains(err.Error(), "unknown authority") || strings.Contains(err.Error(), "x509:") {
 			advice = "检测到 TLS 证书校验失败：可能是自签 CA 未信任，或企业出口防火墙启用了 HTTPS 中间人解密代理。请将中心 CA 或企业根证书配置到 server.tls.ca_file。"
@@ -249,18 +251,6 @@ func checkHubTunnelHandshake(ctx context.Context, cfg *Config) CheckResult {
 			Status:  StatusFail,
 			Detail:  fmt.Sprintf("连接 %s (%s) 失败: %v", cfg.Server.URL, cfg.Server.Mode, err),
 			Advice:  advice,
-			Latency: time.Since(start),
-		}
-	}
-	defer func() { _ = conn.Close() }()
-
-	mux, err := yamux.Client(conn, transport.DefaultYamuxConfig())
-	if err != nil {
-		return CheckResult{
-			Name:    "中心隧道出向连通与注册握手",
-			Status:  StatusFail,
-			Detail:  fmt.Sprintf("Yamux 初始化失败: %v", err),
-			Advice:  "请确认链路中间的七层网关（如 Nginx/ALB）已正确开启 WebSocket Upgrade 转发。",
 			Latency: time.Since(start),
 		}
 	}
@@ -317,7 +307,7 @@ func checkHubTunnelHandshake(ctx context.Context, cfg *Config) CheckResult {
 	return CheckResult{
 		Name:    "中心隧道出向连通、TLS 校验与注册握手",
 		Status:  StatusPass,
-		Detail:  fmt.Sprintf("成功接入 %s (%s)，中心签发测试会话 %s，心跳间隔 %ds", cfg.Server.URL, cfg.Server.Mode, resp.SessionID, resp.HeartbeatIntervalSec),
+		Detail:  fmt.Sprintf("成功接入 %s (配置=%s, 实际=%s)，中心签发测试会话 %s，心跳间隔 %ds", cfg.Server.URL, cfg.Server.Mode, activeTransport, resp.SessionID, resp.HeartbeatIntervalSec),
 		Latency: time.Since(start),
 	}
 }
@@ -445,6 +435,48 @@ func checkLocalService(svc ServiceConfig) CheckResult {
 				Detail:  fmt.Sprintf("Redis RESP 识别成功: 需密码认证=%v, 响应=%q%s%s", info.AuthRequired, info.Reply, tlsNote, policyStr),
 				Latency: info.Latency,
 			}
+
+		case "mssql":
+			info, err := guard.ProbeMSSQLTLS(svc.TargetAddr, 3*time.Second, tlsCfg)
+			if err != nil {
+				advice := "请确认 SQL Server 已开启 TCP/IP 协议监听（默认 1433 端口），且本机防火墙放行 Agent 访问。"
+				if tlsCfg != nil {
+					advice = "SQL Server TLS 探测失败！请核对 target_tls.ca_file 与 server_name 配置。"
+				}
+				return CheckResult{Name: name, Status: StatusFail, Detail: fmt.Sprintf("SQL Server TDS PRELOGIN 探测失败: %v", err), Advice: advice}
+			}
+			return CheckResult{
+				Name:    name,
+				Status:  StatusPass,
+				Detail:  fmt.Sprintf("SQL Server TDS PRELOGIN 识别成功: Version=%s, Enc=0x%02x%s", info.ServerVersion, info.Encryption, policyStr),
+				Latency: info.Latency,
+			}
+
+		case "oracle":
+			info, err := guard.ProbeOracleTLS(svc.TargetAddr, 3*time.Second, tlsCfg)
+			if err != nil {
+				advice := "请确认 Oracle Listener（默认 1521/TCPS 2484 端口）正在运行且允许 Agent 主机接入。"
+				return CheckResult{Name: name, Status: StatusFail, Detail: fmt.Sprintf("Oracle TNS 探测失败: %v", err), Advice: advice}
+			}
+			return CheckResult{
+				Name:    name,
+				Status:  StatusPass,
+				Detail:  fmt.Sprintf("Oracle TNS 识别成功: Version=%d, ReplyType=%d%s", info.TNSVersion, info.ReplyType, policyStr),
+				Latency: info.Latency,
+			}
+
+		case "clickhouse":
+			info, err := guard.ProbeClickHouseTLS(svc.TargetAddr, 3*time.Second, tlsCfg)
+			if err != nil {
+				advice := "请确认 ClickHouse HTTP(8123/8443) 或 Native TCP(9000/9440) 监听地址允许 Agent 主机访问。"
+				return CheckResult{Name: name, Status: StatusFail, Detail: fmt.Sprintf("ClickHouse 探测失败: %v", err), Advice: advice}
+			}
+			return CheckResult{
+				Name:    name,
+				Status:  StatusPass,
+				Detail:  fmt.Sprintf("ClickHouse 识别成功 (%s): %s%s", info.Interface, info.Detail, policyStr),
+				Latency: info.Latency,
+			}
 		}
 	}
 
@@ -474,12 +506,14 @@ func checkLocalService(svc ServiceConfig) CheckResult {
 
 	if svc.Protocol == protocol.ProtocolHTTP {
 		scheme := "http"
-		httpCli := &http.Client{Timeout: 3 * time.Second}
+		tr := &http.Transport{DisableKeepAlives: true}
 		if tlsCfg != nil {
 			scheme = "https"
-			httpCli.Transport = &http.Transport{TLSClientConfig: tlsCfg.Clone()}
+			tr.TLSClientConfig = tlsCfg.Clone()
 		}
+		httpCli := &http.Client{Timeout: 3 * time.Second, Transport: tr}
 		resp, err := httpCli.Head(scheme + "://" + svc.TargetAddr + "/")
+		tr.CloseIdleConnections()
 		if err != nil {
 			return CheckResult{
 				Name:    name,
@@ -544,7 +578,7 @@ func detectTCPProbeKind(svc ServiceConfig, g *ProtocolGuardConfig) string {
 	lowerName := strings.ToLower(svc.Name)
 	_, port, _ := net.SplitHostPort(svc.TargetAddr)
 	switch {
-	case strings.Contains(lowerName, "mysql") || port == "3306" || port == "3307":
+	case strings.Contains(lowerName, "mysql") || strings.Contains(lowerName, "doris") || strings.Contains(lowerName, "starrocks") || port == "3306" || port == "3307" || port == "9030":
 		return "mysql"
 	case strings.Contains(lowerName, "postgres") || strings.Contains(lowerName, "pg") || port == "5432":
 		return "postgres"
@@ -552,6 +586,12 @@ func detectTCPProbeKind(svc ServiceConfig, g *ProtocolGuardConfig) string {
 		return "mongodb"
 	case strings.Contains(lowerName, "redis") || port == "6379":
 		return "redis"
+	case strings.Contains(lowerName, "mssql") || strings.Contains(lowerName, "sqlserver") || port == "1433":
+		return "mssql"
+	case strings.Contains(lowerName, "oracle") || port == "1521" || port == "2484":
+		return "oracle"
+	case strings.Contains(lowerName, "clickhouse") || strings.Contains(lowerName, "ck") || port == "8123" || port == "9000" || port == "9440":
+		return "clickhouse"
 	default:
 		return "tcp"
 	}

@@ -20,6 +20,7 @@ import (
 const (
 	maxMeshControlFrame = 64 * 1024
 	meshRouteCacheTTL   = 30 * time.Second
+	maxMeshRouteEntries = 4096
 )
 
 type cachedPeerRoute struct {
@@ -109,10 +110,28 @@ func (m *MeshPeer) orderedPeersFor(tenantID string) []string {
 }
 
 func (m *MeshPeer) cacheRoute(tenantID, peerAddr string) {
+	now := time.Now()
 	m.routeMu.Lock()
+	if len(m.routeCache) >= maxMeshRouteEntries {
+		for k, v := range m.routeCache {
+			if now.After(v.expiresAt) {
+				delete(m.routeCache, k)
+			}
+		}
+		if len(m.routeCache) >= maxMeshRouteEntries {
+			evict := maxMeshRouteEntries / 8
+			for k := range m.routeCache {
+				delete(m.routeCache, k)
+				evict--
+				if evict <= 0 {
+					break
+				}
+			}
+		}
+	}
 	m.routeCache[tenantID] = cachedPeerRoute{
 		peerAddr:  peerAddr,
-		expiresAt: time.Now().Add(meshRouteCacheTTL),
+		expiresAt: now.Add(meshRouteCacheTTL),
 	}
 	m.routeMu.Unlock()
 }
@@ -132,14 +151,18 @@ func (m *MeshPeer) HasPeers() bool {
 
 // Serve accepts incoming Hub-to-Hub peer forwarding connections on ln.
 func (m *MeshPeer) Serve(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			m.logger.Warn("hub mesh accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go m.handlePeerConn(conn)
 	}
 }

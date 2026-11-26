@@ -1,0 +1,9 @@
+.git
+bin/
+certs/
+dist/
+data/
+logs/
+*.log
+*.tmp
+.DS_Store

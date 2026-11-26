@@ -41,6 +41,8 @@ func (s *scramClient) ClientFirstMessage() string {
 	return "n,," + s.clientFirstBare
 }
 
+const maxSCRAMIterations = 1_000_000
+
 // ProcessServerFirst parses the server's challenge "r=<fullNonce>,s=<b64Salt>,i=<iter>"
 // and returns the client-final-message "c=biws,r=<fullNonce>,p=<b64Proof>".
 func (s *scramClient) ProcessServerFirst(serverFirst string) (string, error) {
@@ -63,7 +65,7 @@ func (s *scramClient) ProcessServerFirst(serverFirst string) (string, error) {
 			iterations = it
 		}
 	}
-	if !strings.HasPrefix(fullNonce, s.clientNonce) || saltB64 == "" || iterations <= 0 {
+	if !strings.HasPrefix(fullNonce, s.clientNonce) || saltB64 == "" || iterations <= 0 || iterations > maxSCRAMIterations {
 		return "", errors.New("malformed SCRAM-SHA-256 server-first-message")
 	}
 	salt, err := base64.StdEncoding.DecodeString(saltB64)

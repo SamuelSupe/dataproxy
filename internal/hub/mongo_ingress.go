@@ -41,14 +41,18 @@ var (
 // (where the tenant Agent proactively authenticates to real MongoDB using local SCRAM-SHA-256
 // credentials), completes the SASL PLAIN handshake, and pipes all subsequent OP_MSG commands.
 func (s *SmartDBIngress) ServeMongo(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			s.logger.Warn("mongo smart router accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go s.handleMongoConn(conn)
 	}
 }
@@ -127,8 +131,9 @@ func (s *SmartDBIngress) handleMongoConn(clientConn net.Conn) {
 				return
 			}
 
+			openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
 			stream, err := s.registry.OpenTenantStreamWithMeta(
-				context.Background(),
+				openCtx,
 				claims.TenantID,
 				claims.ServiceName,
 				protocol.ProtocolTCP,
@@ -138,6 +143,7 @@ func (s *SmartDBIngress) handleMongoConn(clientConn net.Conn) {
 					Purpose:  claims.Purpose,
 				},
 			)
+			cancelOpen()
 			if err != nil {
 				s.logger.Warn("mongo smart router open stream failed", "tenant", claims.TenantID, "service", claims.ServiceName, "error", err)
 				synthID++
@@ -203,14 +209,16 @@ func writeHubMongoAuthErr(w io.Writer, reqID, respTo uint32, msg string) error {
 	return writeHubMongoOpMsg(w, reqID, respTo, doc)
 }
 
+const maxHubPreAuthMongoMsgBytes = 256 * 1024 // Pre-auth hello / saslStart safety cap
+
 func readHubMongoMsg(r io.Reader) (reqID, respTo, opCode uint32, body []byte, err error) {
 	var hdr [16]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return 0, 0, 0, nil, err
 	}
 	msgLen := binary.LittleEndian.Uint32(hdr[0:4])
-	if msgLen < 16 || msgLen > 48*1024*1024 {
-		return 0, 0, 0, nil, errors.New("invalid mongo msg len")
+	if msgLen < 16 || msgLen > maxHubPreAuthMongoMsgBytes {
+		return 0, 0, 0, nil, errors.New("invalid or oversized pre-auth mongo msg len")
 	}
 	reqID = binary.LittleEndian.Uint32(hdr[4:8])
 	respTo = binary.LittleEndian.Uint32(hdr[8:12])
@@ -329,6 +337,9 @@ func parseHubMongoBSON(doc []byte) (cmdName string, fields map[string]hubBsonFie
 				return cmdName, fields
 			}
 			subLen := int(binary.LittleEndian.Uint32(doc[pos : pos+4]))
+			if subLen < 5 || pos+subLen > end {
+				return cmdName, fields
+			}
 			pos += subLen
 		case 0x05:
 			if pos+5 > end {

@@ -68,6 +68,13 @@ func ResolveSecret(spec string) (string, error) {
 			return "", fmt.Errorf("read secret file %q: %w", path, err)
 		}
 		val := strings.TrimRight(string(data), "\r\n")
+		if len(secretCache) >= 256 {
+			for k, v := range secretCache {
+				if !now.Before(v.expiresAt) {
+					delete(secretCache, k)
+				}
+			}
+		}
 		secretCache[path] = cachedFileSecret{val: val, expiresAt: now.Add(fileSecretCacheTTL)}
 		return val, nil
 

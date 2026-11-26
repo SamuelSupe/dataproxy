@@ -2,12 +2,12 @@ package hub
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -46,7 +46,15 @@ type HTTPIngress struct {
 	tickets      *auth.TicketManager
 	domainSuffix string
 	logger       *slog.Logger
+	transport    *http.Transport
 	proxy        *httputil.ReverseProxy
+}
+
+// CloseIdleConnections releases idle reverse-proxy connections during hub shutdown.
+func (h *HTTPIngress) CloseIdleConnections() {
+	if h != nil && h.transport != nil {
+		h.transport.CloseIdleConnections()
+	}
 }
 
 // NewHTTPIngress constructs a multi-tenant HTTP reverse proxy handler.
@@ -85,6 +93,7 @@ func NewHTTPIngress(registry *Registry, acl *auth.CallerACL, tickets *auth.Ticke
 		},
 	}
 
+	h.transport = transport
 	h.proxy = &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -186,20 +195,42 @@ func (h *HTTPIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
-// ensureTraceparent preserves a valid W3C traceparent header or generates a new one.
+// ensureTraceparent preserves a valid W3C traceparent header (zero allocs)
+// or generates a new 55-byte W3C traceparent without OS CSPRNG syscalls.
 func ensureTraceparent(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed != "" {
-		parts := strings.Split(trimmed, "-")
-		if len(parts) == 4 && len(parts[0]) == 2 && len(parts[1]) == 32 && len(parts[2]) == 16 && len(parts[3]) == 2 {
-			return trimmed
+	if isValidW3CTraceparent(trimmed) {
+		return trimmed
+	}
+	var rawIDs [24]byte
+	binary.BigEndian.PutUint64(rawIDs[0:8], rand.Uint64())
+	binary.BigEndian.PutUint64(rawIDs[8:16], rand.Uint64())
+	binary.BigEndian.PutUint64(rawIDs[16:24], rand.Uint64())
+
+	// Format: "00-" + 32 hex + "-" + 16 hex + "-01" (exact length 55)
+	var out [55]byte
+	out[0], out[1], out[2] = '0', '0', '-'
+	hex.Encode(out[3:35], rawIDs[0:16])
+	out[35] = '-'
+	hex.Encode(out[36:52], rawIDs[16:24])
+	out[52], out[53], out[54] = '-', '0', '1'
+	return string(out[:])
+}
+
+func isValidW3CTraceparent(s string) bool {
+	if len(s) != 55 || s[2] != '-' || s[35] != '-' || s[52] != '-' {
+		return false
+	}
+	for i := 0; i < 55; i++ {
+		if i == 2 || i == 35 || i == 52 {
+			continue
+		}
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
 		}
 	}
-	var traceID [16]byte
-	var spanID [8]byte
-	_, _ = rand.Read(traceID[:])
-	_, _ = rand.Read(spanID[:])
-	return fmt.Sprintf("00-%s-%s-01", hex.EncodeToString(traceID[:]), hex.EncodeToString(spanID[:]))
+	return true
 }
 
 func (h *HTTPIngress) resolveTarget(r *http.Request) (tenantID, serviceName string, err error) {

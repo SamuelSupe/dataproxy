@@ -106,48 +106,69 @@ func ProbeMongoDBTLS(addr string, timeout time.Duration, tlsCfg *tls.Config) (*M
 	return info, nil
 }
 
-// Strict allowlist of read-only MongoDB commands.
-var mongoReadOnlyCommands = map[string]bool{
-	"hello": true, "ismaster": true, "isMaster": true, "ping": true,
-	"buildInfo": true, "buildinfo": true, "serverStatus": true, "hostInfo": true,
-	"whatsmyuri": true, "connectionStatus": true, "getLog": true,
-	"find": true, "getMore": true, "killCursors": true,
-	"count": true, "distinct": true, "aggregate": true, "explain": true,
-	"listDatabases": true, "listCollections": true, "listIndexes": true,
-	"collStats": true, "dbStats": true, "dataSize": true,
-	"saslStart": true, "saslContinue": true, "endSessions": true,
-	"getParameter": true, "features": true, "atlasVersion": true,
+// Strict allowlist of read-only MongoDB commands mapped to canonical static strings
+// so allowed-path lookups return the exact command name with zero heap allocations.
+var mongoReadOnlyCommands = map[string]string{
+	"hello": "hello", "ismaster": "ismaster", "isMaster": "isMaster", "ping": "ping",
+	"buildInfo": "buildInfo", "buildinfo": "buildinfo", "serverStatus": "serverStatus", "hostInfo": "hostInfo",
+	"whatsmyuri": "whatsmyuri", "connectionStatus": "connectionStatus", "getLog": "getLog",
+	"find": "find", "getMore": "getMore", "killCursors": "killCursors",
+	"count": "count", "distinct": "distinct", "aggregate": "aggregate", "explain": "explain",
+	"listDatabases": "listDatabases", "listCollections": "listCollections", "listIndexes": "listIndexes",
+	"collStats": "collStats", "dbStats": "dbStats", "dataSize": "dataSize",
+	"saslStart": "saslStart", "saslContinue": "saslContinue", "endSessions": "endSessions",
+	"getParameter": "getParameter", "features": "features", "atlasVersion": "atlasVersion",
 }
 
 // CheckMongoCommandReadOnly inspects a BSON command document and verifies it is strictly read-only.
-// For "aggregate", it additionally inspects every pipeline stage to block "$out" and "$merge".
+// Fast path extracts the leading command key in O(1) with zero heap allocations for standard
+// read-only commands (find, getMore, ping, hello, etc.), and deeply inspects pipeline stages
+// for "aggregate" to block "$out" and "$merge".
 func CheckMongoCommandReadOnly(bsonDoc []byte) (cmdName string, allowed bool, reason string) {
-	elems, err := parseBSONTopLevel(bsonDoc)
-	if err != nil || len(elems) == 0 {
+	if len(bsonDoc) < 7 {
 		return "unknown", false, "malformed MongoDB BSON command blocked in read-only mode"
 	}
-	cmdName = elems[0].key
-	if !mongoReadOnlyCommands[cmdName] {
+	docLen := int(binary.LittleEndian.Uint32(bsonDoc[0:4]))
+	if docLen < 7 || docLen > len(bsonDoc) || bsonDoc[4] == 0x00 {
+		return "unknown", false, "malformed MongoDB BSON command blocked in read-only mode"
+	}
+	end := docLen - 1
+	kEnd := bytes.IndexByte(bsonDoc[5:end], 0x00)
+	if kEnd <= 0 {
+		return "unknown", false, "malformed MongoDB BSON command blocked in read-only mode"
+	}
+	keyBytes := bsonDoc[5 : 5+kEnd]
+	// Compiler-optimized zero-alloc map lookup for string(keyBytes).
+	canonical, ok := mongoReadOnlyCommands[string(keyBytes)]
+	if !ok {
+		cmdName = string(keyBytes)
 		return cmdName, false, "MongoDB command '" + cmdName + "' is blocked by tenant read-only policy"
 	}
-	if cmdName == "aggregate" {
-		for _, el := range elems {
-			if el.key == "pipeline" && el.valType == 0x04 { // BSON Array
-				stages, _ := parseBSONTopLevel(el.rawVal)
-				for _, st := range stages {
-					if st.valType == 0x03 { // Embedded stage document
-						stageFields, _ := parseBSONTopLevel(st.rawVal)
-						for _, f := range stageFields {
-							if f.key == "$out" || f.key == "$merge" {
-								return cmdName, false, "MongoDB aggregate stage '" + f.key + "' is blocked by tenant read-only policy"
-							}
+	if canonical != "aggregate" {
+		return canonical, true, ""
+	}
+
+	// Deep inspection only for "aggregate" pipelines to block $out / $merge write stages.
+	elems, err := parseBSONTopLevel(bsonDoc)
+	if err != nil || len(elems) == 0 {
+		return "aggregate", false, "malformed MongoDB BSON command blocked in read-only mode"
+	}
+	for _, el := range elems {
+		if el.key == "pipeline" && el.valType == 0x04 { // BSON Array
+			stages, _ := parseBSONTopLevel(el.rawVal)
+			for _, st := range stages {
+				if st.valType == 0x03 { // Embedded stage document
+					stageFields, _ := parseBSONTopLevel(st.rawVal)
+					for _, f := range stageFields {
+						if f.key == "$out" || f.key == "$merge" {
+							return "aggregate", false, "MongoDB aggregate stage '" + f.key + "' is blocked by tenant read-only policy"
 						}
 					}
 				}
 			}
 		}
 	}
-	return cmdName, true, ""
+	return "aggregate", true, ""
 }
 
 // MongoProxy intercepts MongoDB OP_MSG traffic for local proactive SCRAM-SHA-256
@@ -183,9 +204,11 @@ func (p *MongoProxy) Proxy(
 		if err != nil {
 			return 0, 0, fmt.Errorf("resolve local mongo password: %w", err)
 		}
+		_ = serverConn.SetDeadline(time.Now().Add(15 * time.Second))
 		if err := authenticateMongoSCRAM(serverConn, p.cfg.AuthSource, realUser, realPass); err != nil {
 			return 0, 0, fmt.Errorf("local mongo SCRAM-SHA-256 auth failed: %w", err)
 		}
+		_ = serverConn.SetDeadline(time.Time{})
 	}
 
 	if !p.cfg.ReadOnly {
@@ -197,7 +220,11 @@ func (p *MongoProxy) Proxy(
 	var serverCopyBytes atomic.Int64
 	srvDone := make(chan struct{})
 	go func() {
-		defer close(srvDone)
+		defer func() {
+			// Unblock client read loop immediately if the backend MongoDB server disconnects.
+			_ = clientConn.Close()
+			close(srvDone)
+		}()
 		bufPtr := transport.GetCopyBuf()
 		defer transport.PutCopyBuf(bufPtr)
 		buf := *bufPtr
@@ -218,13 +245,17 @@ func (p *MongoProxy) Proxy(
 		}
 	}()
 
+	cmdBufPtr := transport.GetCopyBuf()
+	defer transport.PutCopyBuf(cmdBufPtr)
+	cmdBuf := *cmdBufPtr
+
 	var synthReqID uint32 = 900000000
 	for {
-		reqID, respTo, opCode, body, err := readMongoMessage(clientConn)
+		reqID, _, opCode, body, rawFrame, err := readMongoMessageReusable(clientConn, cmdBuf)
 		if err != nil {
 			break
 		}
-		bytesIn += int64(len(body) + 16)
+		bytesIn += int64(len(rawFrame))
 
 		switch opCode {
 		case mongoOpMsg:
@@ -270,7 +301,7 @@ func (p *MongoProxy) Proxy(
 			continue
 		}
 
-		if err := writeRawMongoMessage(serverConn, reqID, respTo, opCode, body); err != nil {
+		if _, err := serverConn.Write(rawFrame); err != nil {
 			break
 		}
 	}
@@ -417,6 +448,34 @@ func isLegacyReadOnlyOpQuery(body []byte) bool {
 	}
 	_, ok, _ := CheckMongoCommandReadOnly(body[pos:])
 	return ok
+}
+
+func readMongoMessageReusable(r io.Reader, scratch []byte) (reqID, respTo, opCode uint32, body, rawFrame []byte, err error) {
+	var hdr [16]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, 0, 0, nil, nil, err
+	}
+	msgLen := binary.LittleEndian.Uint32(hdr[0:4])
+	if msgLen < 16 || msgLen > 48*1024*1024 {
+		return 0, 0, 0, nil, nil, fmt.Errorf("invalid mongo message length %d", msgLen)
+	}
+	reqID = binary.LittleEndian.Uint32(hdr[4:8])
+	respTo = binary.LittleEndian.Uint32(hdr[8:12])
+	opCode = binary.LittleEndian.Uint32(hdr[12:16])
+	total := int(msgLen)
+	if total <= len(scratch) {
+		rawFrame = scratch[:total]
+	} else {
+		rawFrame = make([]byte, total)
+	}
+	copy(rawFrame[:16], hdr[:])
+	body = rawFrame[16:total]
+	if len(body) > 0 {
+		if _, err := io.ReadFull(r, body); err != nil {
+			return 0, 0, 0, nil, nil, err
+		}
+	}
+	return reqID, respTo, opCode, body, rawFrame, nil
 }
 
 func readMongoMessage(r io.Reader) (reqID, respTo, opCode uint32, body []byte, err error) {

@@ -1,15 +1,25 @@
 package hub
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dataproxy/internal/auth"
 )
+
+var metricsBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
 
 // AdminAPI provides runtime management and observability endpoints for dataproxy-hub.
 type AdminAPI struct {
@@ -85,79 +95,106 @@ func (a *AdminAPI) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *AdminAPI) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	buf := metricsBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= 256*1024 {
+			buf.Reset()
+			metricsBufPool.Put(buf)
+		}
+	}()
+
 	snaps := a.registry.Snapshot()
 	bindings := a.portMapper.List()
 
-	fmt.Fprintf(w, "# HELP dataproxy_online_tenants Number of tenants with at least one connected agent.\n")
-	fmt.Fprintf(w, "# TYPE dataproxy_online_tenants gauge\n")
-	fmt.Fprintf(w, "dataproxy_online_tenants %d\n", len(snaps))
+	fmt.Fprintf(buf, "# HELP dataproxy_online_tenants Number of tenants with at least one connected agent.\n")
+	fmt.Fprintf(buf, "# TYPE dataproxy_online_tenants gauge\n")
+	fmt.Fprintf(buf, "dataproxy_online_tenants %d\n", len(snaps))
 
-	fmt.Fprintf(w, "# HELP dataproxy_rejected_streams_total Total streams rejected by tenant agents.\n")
-	fmt.Fprintf(w, "# TYPE dataproxy_rejected_streams_total counter\n")
-	fmt.Fprintf(w, "dataproxy_rejected_streams_total %d\n", a.registry.RejectedStreams())
+	fmt.Fprintf(buf, "# HELP dataproxy_rejected_streams_total Total streams rejected by tenant agents.\n")
+	fmt.Fprintf(buf, "# TYPE dataproxy_rejected_streams_total counter\n")
+	fmt.Fprintf(buf, "dataproxy_rejected_streams_total %d\n", a.registry.RejectedStreams())
 
-	fmt.Fprintf(w, "# HELP dataproxy_tcp_bindings Active TCP port bindings on the hub.\n")
-	fmt.Fprintf(w, "# TYPE dataproxy_tcp_bindings gauge\n")
-	fmt.Fprintf(w, "dataproxy_tcp_bindings %d\n", len(bindings))
+	fmt.Fprintf(buf, "# HELP dataproxy_tcp_bindings Active TCP port bindings on the hub.\n")
+	fmt.Fprintf(buf, "# TYPE dataproxy_tcp_bindings gauge\n")
+	fmt.Fprintf(buf, "dataproxy_tcp_bindings %d\n", len(bindings))
 
-	fmt.Fprintf(w, "# HELP dataproxy_tenant_active_streams Currently active streams per tenant.\n")
-	fmt.Fprintf(w, "# TYPE dataproxy_tenant_active_streams gauge\n")
+	transportCounts := make(map[string]int, 4)
+	fmt.Fprintf(buf, "# HELP dataproxy_tenant_active_streams Currently active streams per tenant.\n")
+	fmt.Fprintf(buf, "# TYPE dataproxy_tenant_active_streams gauge\n")
 	for _, ts := range snaps {
 		var active, inBytes, outBytes int64
 		for _, s := range ts.Sessions {
 			active += s.ActiveStreams
 			inBytes += s.BytesIn
 			outBytes += s.BytesOut
+			transportCounts[s.Transport]++
 		}
-		fmt.Fprintf(w, "dataproxy_tenant_active_streams{tenant_id=%q} %d\n", ts.TenantID, active)
-		fmt.Fprintf(w, "dataproxy_tenant_bytes_in_total{tenant_id=%q} %d\n", ts.TenantID, inBytes)
-		fmt.Fprintf(w, "dataproxy_tenant_bytes_out_total{tenant_id=%q} %d\n", ts.TenantID, outBytes)
+		fmt.Fprintf(buf, "dataproxy_tenant_active_streams{tenant_id=%q} %d\n", ts.TenantID, active)
+		fmt.Fprintf(buf, "dataproxy_tenant_bytes_in_total{tenant_id=%q} %d\n", ts.TenantID, inBytes)
+		fmt.Fprintf(buf, "dataproxy_tenant_bytes_out_total{tenant_id=%q} %d\n", ts.TenantID, outBytes)
 		for _, s := range ts.Sessions {
 			for _, h := range s.ServiceHealth {
 				val := 0
 				if h.Healthy {
 					val = 1
 				}
-				fmt.Fprintf(w, "dataproxy_tenant_service_healthy{tenant_id=%q,agent_id=%q,service=%q} %d\n",
+				fmt.Fprintf(buf, "dataproxy_tenant_service_healthy{tenant_id=%q,agent_id=%q,service=%q} %d\n",
 					ts.TenantID, s.AgentID, h.Name, val)
 			}
 		}
 	}
 
+	if len(transportCounts) > 0 {
+		tNames := make([]string, 0, len(transportCounts))
+		for k := range transportCounts {
+			tNames = append(tNames, k)
+		}
+		sort.Strings(tNames)
+		fmt.Fprintf(buf, "# HELP dataproxy_sessions_by_transport Connected agent sessions grouped by transport protocol (wss/quic/tls).\n")
+		fmt.Fprintf(buf, "# TYPE dataproxy_sessions_by_transport gauge\n")
+		for _, tr := range tNames {
+			fmt.Fprintf(buf, "dataproxy_sessions_by_transport{transport=%q} %d\n", tr, transportCounts[tr])
+		}
+	}
+
 	if a.metrics != nil {
-		fmt.Fprintf(w, "# HELP dataproxy_mesh_forwarded_streams_total Total streams forwarded across Hub cluster mesh peers.\n")
-		fmt.Fprintf(w, "# TYPE dataproxy_mesh_forwarded_streams_total counter\n")
-		fmt.Fprintf(w, "dataproxy_mesh_forwarded_streams_total %d\n", a.metrics.MeshForwardedStreams.Load())
+		fmt.Fprintf(buf, "# HELP dataproxy_mesh_forwarded_streams_total Total streams forwarded across Hub cluster mesh peers.\n")
+		fmt.Fprintf(buf, "# TYPE dataproxy_mesh_forwarded_streams_total counter\n")
+		fmt.Fprintf(buf, "dataproxy_mesh_forwarded_streams_total %d\n", a.metrics.MeshForwardedStreams.Load())
 
-		fmt.Fprintf(w, "# HELP dataproxy_quota_rejected_streams_total Total streams rejected by Hub per-tenant concurrency quota.\n")
-		fmt.Fprintf(w, "# TYPE dataproxy_quota_rejected_streams_total counter\n")
-		fmt.Fprintf(w, "dataproxy_quota_rejected_streams_total %d\n", a.metrics.QuotaRejectedStreams.Load())
+		fmt.Fprintf(buf, "# HELP dataproxy_quota_rejected_streams_total Total streams rejected by Hub per-tenant concurrency quota.\n")
+		fmt.Fprintf(buf, "# TYPE dataproxy_quota_rejected_streams_total counter\n")
+		fmt.Fprintf(buf, "dataproxy_quota_rejected_streams_total %d\n", a.metrics.QuotaRejectedStreams.Load())
 
-		fmt.Fprintf(w, "# HELP dataproxy_rate_limited_handshakes_total Total tunnel handshake/enroll requests rejected by per-IP rate limiter.\n")
-		fmt.Fprintf(w, "# TYPE dataproxy_rate_limited_handshakes_total counter\n")
-		fmt.Fprintf(w, "dataproxy_rate_limited_handshakes_total %d\n", a.metrics.RateLimitedHandshakes.Load())
+		fmt.Fprintf(buf, "# HELP dataproxy_rate_limited_handshakes_total Total tunnel handshake/enroll requests rejected by per-IP rate limiter.\n")
+		fmt.Fprintf(buf, "# TYPE dataproxy_rate_limited_handshakes_total counter\n")
+		fmt.Fprintf(buf, "dataproxy_rate_limited_handshakes_total %d\n", a.metrics.RateLimitedHandshakes.Load())
 
-		a.metrics.StreamOpenDuration.WritePrometheus(w, "dataproxy_stream_open_duration_seconds", "End-to-end latency to open a stream to a tenant agent.")
-		a.metrics.TunnelRTT.WritePrometheus(w, "dataproxy_tunnel_rtt_seconds", "Measured yamux tunnel heartbeat round-trip time.")
+		a.metrics.StreamOpenDuration.WritePrometheus(buf, "dataproxy_stream_open_duration_seconds", "End-to-end latency to open a stream to a tenant agent.")
+		a.metrics.TunnelRTT.WritePrometheus(buf, "dataproxy_tunnel_rtt_seconds", "Measured tunnel heartbeat round-trip time (Yamux ping / QUIC RFC 9002 SmoothedRTT).")
 	}
 
 	if a.devices != nil {
 		devs := a.devices.ListDevices()
 		if len(devs) > 0 {
 			now := time.Now().UTC()
-			fmt.Fprintf(w, "# HELP dataproxy_device_cert_expiry_seconds Seconds remaining until enrolled device certificate expires.\n")
-			fmt.Fprintf(w, "# TYPE dataproxy_device_cert_expiry_seconds gauge\n")
+			fmt.Fprintf(buf, "# HELP dataproxy_device_cert_expiry_seconds Seconds remaining until enrolled device certificate expires.\n")
+			fmt.Fprintf(buf, "# TYPE dataproxy_device_cert_expiry_seconds gauge\n")
 			for _, d := range devs {
 				if d.Revoked {
 					continue
 				}
 				rem := d.CertExpiresAt.Sub(now).Seconds()
-				fmt.Fprintf(w, "dataproxy_device_cert_expiry_seconds{tenant_id=%q,device_id=%q} %.0f\n",
+				fmt.Fprintf(buf, "dataproxy_device_cert_expiry_seconds{tenant_id=%q,device_id=%q} %.0f\n",
 					d.TenantID, d.DeviceID, rem)
 			}
 		}
 	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (a *AdminAPI) handleListTenants(w http.ResponseWriter, _ *http.Request) {
@@ -174,10 +211,17 @@ type upsertTenantReq struct {
 	RequireMTLS bool   `json:"require_mtls"`
 }
 
+const maxAdminBodyBytes = 1 << 20 // 1 MiB cap for admin JSON control-plane requests
+
+func decodeLimitedJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminBodyBytes)
+	return json.NewDecoder(r.Body).Decode(dst)
+}
+
 func (a *AdminAPI) handleUpsertTenant(w http.ResponseWriter, r *http.Request) {
 	var req upsertTenantReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+	if err := decodeLimitedJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	err := a.tenantAuth.Upsert(auth.TenantRecord{
@@ -228,8 +272,8 @@ type createBindingReq struct {
 
 func (a *AdminAPI) handleCreateBinding(w http.ResponseWriter, r *http.Request) {
 	var req createBindingReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+	if err := decodeLimitedJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	info, err := a.portMapper.Add(TCPBindingSpec{
@@ -269,8 +313,8 @@ func (a *AdminAPI) handleIssueTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req issueTicketReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+	if err := decodeLimitedJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	issued, err := a.tickets.Issue(req.TenantID, req.ServiceName, time.Duration(req.TTLSeconds)*time.Second, req.Purpose)
@@ -293,8 +337,8 @@ func (a *AdminAPI) handleCreateEnrollment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req createEnrollmentReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+	if err := decodeLimitedJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or oversized json body"})
 		return
 	}
 	info, err := a.devices.CreateEnrollment(req.TenantID, req.DeviceName, time.Duration(req.TTLSeconds)*time.Second)
@@ -322,7 +366,7 @@ func (a *AdminAPI) handleRevokeDevice(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Reason string `json:"reason"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	_ = decodeLimitedJSON(w, r, &req)
 	rec, err := a.devices.RevokeDevice(deviceID, req.Reason)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})

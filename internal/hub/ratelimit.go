@@ -41,6 +41,8 @@ func NewIPRateLimiter(ratePerMin float64, burst int) *IPRateLimiter {
 	}
 }
 
+const maxRateLimitEntries = 16384
+
 // Allow consumes one token for remoteAddr (host:port or bare IP) and reports whether allowed.
 func (l *IPRateLimiter) Allow(remoteAddr string) bool {
 	if l == nil || l.ratePerSec <= 0 {
@@ -64,6 +66,26 @@ func (l *IPRateLimiter) Allow(remoteAddr string) bool {
 
 	b, ok := l.buckets[ip]
 	if !ok {
+		// Hard memory cap against distributed IP-spoofed handshake floods.
+		if len(l.buckets) >= maxRateLimitEntries {
+			cutoff := now.Add(-2 * time.Minute)
+			for k, existing := range l.buckets {
+				if existing.lastSeen.Before(cutoff) {
+					delete(l.buckets, k)
+				}
+			}
+			if len(l.buckets) >= maxRateLimitEntries {
+				// Evict ~1/8th of entries to keep memory strictly O(1) bounded.
+				evictTarget := maxRateLimitEntries / 8
+				for k := range l.buckets {
+					delete(l.buckets, k)
+					evictTarget--
+					if evictTarget <= 0 {
+						break
+					}
+				}
+			}
+		}
 		b = &ipBucket{
 			tokens:   l.burst,
 			lastSeen: now,

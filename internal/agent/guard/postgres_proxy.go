@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"dataproxy/internal/transport"
 )
@@ -219,6 +220,11 @@ func (p *PostgresProxy) Proxy(
 	clientConn, serverConn net.Conn,
 	onBlocked func(msgType byte, sql, reason string),
 ) (bytesIn, bytesOut int64, err error) {
+	// Bound the startup & authentication handshake so stalled peers never leak streams indefinitely.
+	hsDeadline := time.Now().Add(15 * time.Second)
+	_ = clientConn.SetDeadline(hsDeadline)
+	_ = serverConn.SetDeadline(hsDeadline)
+
 	// 1. Handle optional SSLRequest / GSSENCRequest followed by StartupMessage.
 	var startupBody []byte
 	for {
@@ -294,7 +300,7 @@ func (p *PostgresProxy) Proxy(
 			_ = writePGError(clientConn, "08006", "dataproxy-agent: TLS handshake with target PostgreSQL failed")
 			return bytesIn, bytesOut, fmt.Errorf("postgres target TLS handshake failed: %w", err)
 		}
-		_ = tlsConn.SetDeadline(time.Time{})
+		_ = tlsConn.SetDeadline(hsDeadline)
 		serverConn = tlsConn
 	}
 
@@ -419,7 +425,9 @@ func (p *PostgresProxy) Proxy(
 		}
 	}
 
-	// 4. If only credential injection was enabled, switch to zero-copy pipe!
+	// 4. Clear handshake deadlines; if only credential injection was enabled, switch to zero-copy pipe!
+	_ = clientConn.SetDeadline(time.Time{})
+	_ = serverConn.SetDeadline(time.Time{})
 	if !p.cfg.ReadOnly {
 		in2, out2 := transport.BidirectionalPipe(clientConn, serverConn)
 		return bytesIn + in2, bytesOut + out2, nil
@@ -430,7 +438,11 @@ func (p *PostgresProxy) Proxy(
 	var serverCopyBytes atomic.Int64
 	srvDone := make(chan struct{})
 	go func() {
-		defer close(srvDone)
+		defer func() {
+			// Unblock client read loop immediately if the backend PostgreSQL server disconnects.
+			_ = clientConn.Close()
+			close(srvDone)
+		}()
 		bufPtr := transport.GetCopyBuf()
 		defer transport.PutCopyBuf(bufPtr)
 		buf := *bufPtr
@@ -451,15 +463,20 @@ func (p *PostgresProxy) Proxy(
 		}
 	}()
 
+	// Reuse a single pooled 64KiB buffer across the command loop for zero-alloc, zero-copy forwarding.
+	cmdBufPtr := transport.GetCopyBuf()
+	defer transport.PutCopyBuf(cmdBufPtr)
+	cmdBuf := *cmdBufPtr
+
 	skipUntilSync := false
 	var blockedReason string
 
 	for {
-		cType, cPayload, err := readPGMsg(clientConn)
+		cType, cPayload, rawFrame, err := readPGMsgReusable(clientConn, cmdBuf)
 		if err != nil {
 			break
 		}
-		bytesIn += int64(len(cPayload) + 5)
+		bytesIn += int64(len(rawFrame))
 
 		if skipUntilSync {
 			if cType == 'S' { // Sync ends extended query pipeline
@@ -475,11 +492,12 @@ func (p *PostgresProxy) Proxy(
 
 		switch cType {
 		case 'Q': // Simple Query: payload is NUL-terminated SQL
-			sqlText := string(bytes.TrimRight(cPayload, "\x00"))
-			if ok, reason := IsReadOnlyPGSQL(sqlText); !ok {
+			trimmed := bytes.TrimRight(cPayload, "\x00")
+			sqlView := unsafe.String(unsafe.SliceData(trimmed), len(trimmed))
+			if ok, reason := IsReadOnlyPGSQL(sqlView); !ok {
 				p.blockedQueries.Add(1)
 				if onBlocked != nil {
-					onBlocked(cType, sqlText, reason)
+					onBlocked(cType, string(trimmed), reason)
 				}
 				clientWriteMu.Lock()
 				_ = writePGError(clientConn, "25006", "dataproxy-agent: "+reason)
@@ -494,11 +512,12 @@ func (p *PostgresProxy) Proxy(
 				rest := cPayload[firstNul+1:]
 				secondNul := bytes.IndexByte(rest, 0x00)
 				if secondNul >= 0 {
-					sqlText := string(rest[:secondNul])
-					if ok, reason := IsReadOnlyPGSQL(sqlText); !ok {
+					qBytes := rest[:secondNul]
+					sqlView := unsafe.String(unsafe.SliceData(qBytes), len(qBytes))
+					if ok, reason := IsReadOnlyPGSQL(sqlView); !ok {
 						p.blockedQueries.Add(1)
 						if onBlocked != nil {
-							onBlocked(cType, sqlText, reason)
+							onBlocked(cType, string(qBytes), reason)
 						}
 						skipUntilSync = true
 						blockedReason = reason
@@ -519,7 +538,7 @@ func (p *PostgresProxy) Proxy(
 			continue
 		}
 
-		if err := writePGMsg(serverConn, cType, cPayload); err != nil {
+		if _, err := serverConn.Write(rawFrame); err != nil {
 			break
 		}
 		if cType == 'X' { // Terminate
@@ -586,6 +605,32 @@ func computePGMD5(user, password string, salt []byte) string {
 	h1Hex := hex.EncodeToString(h1[:])
 	h2 := md5.Sum(append([]byte(h1Hex), salt...))
 	return "md5" + hex.EncodeToString(h2[:])
+}
+
+func readPGMsgReusable(r io.Reader, scratch []byte) (msgType byte, payload, rawFrame []byte, err error) {
+	var hdr [5]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, nil, err
+	}
+	length := binary.BigEndian.Uint32(hdr[1:5])
+	if length < 4 || length > 64*1024*1024 {
+		return 0, nil, nil, fmt.Errorf("invalid pg message length %d", length)
+	}
+	payloadLen := int(length - 4)
+	total := 5 + payloadLen
+	if total <= len(scratch) {
+		rawFrame = scratch[:total]
+	} else {
+		rawFrame = make([]byte, total)
+	}
+	copy(rawFrame[:5], hdr[:])
+	payload = rawFrame[5:total]
+	if payloadLen > 0 {
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return 0, nil, nil, err
+		}
+	}
+	return hdr[0], payload, rawFrame, nil
 }
 
 func readPGMsg(r io.Reader) (byte, []byte, error) {

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Static analysis (go vet)
+        run: go vet ./...
+
+      - name: Run unit & E2E tests with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Verify cross-platform builds
+        run: |
+          for target in "linux amd64" "linux arm64" "darwin arm64" "windows amd64"; do
+            set -- $target
+            os=$1
+            arch=$2
+            ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -o "/tmp/dataproxy-hub-${os}-${arch}${ext}" ./cmd/dataproxy-hub
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -o "/tmp/dataproxy-agent-${os}-${arch}${ext}" ./cmd/dataproxy-agent
+          done
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and smoke-test Hub & Agent Docker images
+        run: |
+          docker build --target hub --build-arg VERSION=ci -t dataproxy-hub:ci .
+          docker build --target agent --build-arg VERSION=ci -t dataproxy-agent:ci .
+          docker run --rm dataproxy-hub:ci -version
+          docker run --rm dataproxy-agent:ci -version

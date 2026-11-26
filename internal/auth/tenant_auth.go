@@ -30,9 +30,10 @@ type TenantRecord struct {
 // TenantAuthenticator verifies agent identity via constant-time token matching
 // and optional mTLS peer certificate CN/SAN binding, with optional persistent Store.
 type TenantAuthenticator struct {
-	mu      sync.RWMutex
-	tenants map[string]tenantEntry
-	st      store.Store
+	mu            sync.RWMutex
+	tenants       map[string]tenantEntry
+	staticTenants map[string]struct{}
+	st            store.Store
 }
 
 type tenantEntry struct {
@@ -49,8 +50,9 @@ func NewTenantAuthenticator(records []TenantRecord) (*TenantAuthenticator, error
 // NewTenantAuthenticatorWithStore loads persisted tenants from st (if provided) and merges config records.
 func NewTenantAuthenticatorWithStore(records []TenantRecord, st store.Store) (*TenantAuthenticator, error) {
 	a := &TenantAuthenticator{
-		tenants: make(map[string]tenantEntry, len(records)),
-		st:      st,
+		tenants:       make(map[string]tenantEntry, len(records)),
+		staticTenants: make(map[string]struct{}, len(records)),
+		st:            st,
 	}
 	if st != nil {
 		if snap, err := st.Load(); err == nil && snap != nil {
@@ -68,8 +70,41 @@ func NewTenantAuthenticatorWithStore(records []TenantRecord, st store.Store) (*T
 		if err := a.upsertInternal(r, false); err != nil {
 			return nil, err
 		}
+		a.staticTenants[strings.TrimSpace(r.TenantID)] = struct{}{}
 	}
 	return a, nil
+}
+
+// SyncTenants merges dynamic tenant changes from a shared ClusterStore into memory and
+// returns tenant IDs that were disabled or removed so the Hub can kick their active sessions.
+func (a *TenantAuthenticator) SyncTenants(persisted []store.PersistedTenant) (kickedTenants []string) {
+	seen := make(map[string]struct{}, len(persisted))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, pt := range persisted {
+		seen[pt.TenantID] = struct{}{}
+		hashBytes, err := normalizeTokenHash(pt.TokenHash)
+		if err != nil {
+			continue
+		}
+		a.tenants[pt.TenantID] = tenantEntry{
+			hashBytes:   hashBytes,
+			disabled:    pt.Disabled,
+			requireMTLS: pt.RequireMTLS,
+		}
+		if pt.Disabled {
+			kickedTenants = append(kickedTenants, pt.TenantID)
+		}
+	}
+	for tid := range a.tenants {
+		if _, ok := seen[tid]; !ok {
+			if _, isStatic := a.staticTenants[tid]; !isStatic {
+				delete(a.tenants, tid)
+				kickedTenants = append(kickedTenants, tid)
+			}
+		}
+	}
+	return kickedTenants
 }
 
 // Upsert registers or updates a tenant's authentication record (and persists if Store is enabled).

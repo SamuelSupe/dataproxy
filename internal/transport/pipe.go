@@ -70,14 +70,20 @@ func BidirectionalPipe(a, b net.Conn) (aToB int64, bToA int64) {
 		bufPtr := GetCopyBuf()
 		defer PutCopyBuf(bufPtr)
 
-		n, _ := io.CopyBuffer(dst, src, *bufPtr)
+		n, err := io.CopyBuffer(dst, src, *bufPtr)
 		*written = n
 
-		if cw, ok := dst.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		} else {
-			_ = dst.Close()
+		if err == nil {
+			// Clean EOF from src: propagate half-close so dst can finish sending remaining response bytes.
+			if cw, ok := dst.(closeWriter); ok {
+				_ = cw.CloseWrite()
+				return
+			}
 		}
+		// Abrupt read/write error (RST, broken pipe, timeout) or no half-close support:
+		// immediately tear down both sides so the reverse goroutine never hangs on a dead peer.
+		_ = dst.Close()
+		_ = src.Close()
 	}
 
 	go copyDir(b, a, &aToB)

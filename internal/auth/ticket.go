@@ -57,7 +57,8 @@ const (
 	jwtHeaderHS256          = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" // base64url({"alg":"HS256","typ":"JWT"})
 	ticketPruneMinInterval  = 30                                     // seconds
 	ticketPruneHighWater    = 10000
-	ticketPruneFastInterval = 5 // seconds when above high water mark
+	ticketPruneFastInterval = 5     // seconds when above high water mark
+	maxStoredTickets        = 65536 // hard memory cap; stateless JWT/MySQL HMAC verify still works after eviction
 )
 
 // TicketManager issues and verifies short-lived HS256 job tickets and tracks compact
@@ -138,7 +139,20 @@ func (tm *TicketManager) Issue(tenantID, serviceName string, ttl time.Duration, 
 
 	tm.mu.Lock()
 	nowUnix := now.Unix()
-	if (len(tm.tickets) >= ticketPruneHighWater && nowUnix-tm.lastPruneAt >= ticketPruneFastInterval) ||
+	if len(tm.tickets) >= maxStoredTickets {
+		tm.pruneExpiredLocked(nowUnix)
+		tm.lastPruneAt = nowUnix
+		if len(tm.tickets) >= maxStoredTickets {
+			evict := maxStoredTickets / 8
+			for id := range tm.tickets {
+				delete(tm.tickets, id)
+				evict--
+				if evict <= 0 {
+					break
+				}
+			}
+		}
+	} else if (len(tm.tickets) >= ticketPruneHighWater && nowUnix-tm.lastPruneAt >= ticketPruneFastInterval) ||
 		nowUnix-tm.lastPruneAt >= ticketPruneMinInterval {
 		tm.pruneExpiredLocked(nowUnix)
 		tm.lastPruneAt = nowUnix

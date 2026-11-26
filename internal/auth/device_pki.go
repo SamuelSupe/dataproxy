@@ -160,7 +160,22 @@ func NewDeviceManager(caCertFile, caKeyFile string, certTTL, enrollTTL time.Dura
 		if st != nil {
 			keyDER, _ := x509.MarshalECPrivateKey(priv)
 			keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-			_ = st.SaveDeviceCA(string(caPEM), string(keyPEM))
+			if cs, ok := st.(store.ClusterStore); ok {
+				finalCertPEM, finalKeyPEM, err := cs.SaveDeviceCAIfAbsent(string(caPEM), string(keyPEM))
+				if err != nil {
+					return nil, fmt.Errorf("persist shared cluster device ca: %w", err)
+				}
+				if finalCertPEM != string(caPEM) {
+					// Another Hub node initialized the cluster CA concurrently; converge onto it.
+					caCert, caSigner, err = parseCAPair([]byte(finalCertPEM), []byte(finalKeyPEM))
+					if err != nil {
+						return nil, fmt.Errorf("parse converged cluster device ca: %w", err)
+					}
+					caPEM = []byte(finalCertPEM)
+				}
+			} else {
+				_ = st.SaveDeviceCA(string(caPEM), string(keyPEM))
+			}
 		}
 	}
 
@@ -261,25 +276,37 @@ func (dm *DeviceManager) CreateEnrollment(tenantID, deviceName string, ttl time.
 	code := "enroll_" + randomHex(16)
 	now := time.Now().UTC()
 	exp := now.Add(ttl)
+	cleanDeviceName := strings.TrimSpace(deviceName)
 
-	dm.mu.Lock()
-	// Prune expired or already-used enrollment codes to bound memory usage.
-	for k, v := range dm.enrollments {
-		if v.used || now.After(v.expiresAt) {
-			delete(dm.enrollments, k)
+	if cs, ok := dm.st.(store.ClusterStore); ok {
+		if err := cs.SaveEnrollment(store.PersistedEnrollment{
+			Code:       code,
+			TenantID:   tenantID,
+			DeviceName: cleanDeviceName,
+			ExpiresAt:  exp,
+		}); err != nil {
+			return nil, fmt.Errorf("persist cluster enrollment code: %w", err)
 		}
+	} else {
+		dm.mu.Lock()
+		// Prune expired or already-used enrollment codes to bound memory usage.
+		for k, v := range dm.enrollments {
+			if v.used || now.After(v.expiresAt) {
+				delete(dm.enrollments, k)
+			}
+		}
+		dm.enrollments[code] = &enrollmentEntry{
+			tenantID:   tenantID,
+			deviceName: cleanDeviceName,
+			expiresAt:  exp,
+		}
+		dm.mu.Unlock()
 	}
-	dm.enrollments[code] = &enrollmentEntry{
-		tenantID:   tenantID,
-		deviceName: strings.TrimSpace(deviceName),
-		expiresAt:  exp,
-	}
-	dm.mu.Unlock()
 
 	return &EnrollmentInfo{
 		Code:       code,
 		TenantID:   tenantID,
-		DeviceName: strings.TrimSpace(deviceName),
+		DeviceName: cleanDeviceName,
 		ExpiresAt:  exp,
 	}, nil
 }
@@ -293,17 +320,31 @@ func (dm *DeviceManager) CompleteEnrollment(code, csrPEM string) (*DeviceCertBun
 		return nil, err
 	}
 
-	dm.mu.Lock()
-	enr, ok := dm.enrollments[strings.TrimSpace(code)]
-	if !ok || enr.used || time.Now().UTC().After(enr.expiresAt) {
+	var tenantID, deviceName string
+	trimmedCode := strings.TrimSpace(code)
+	if cs, ok := dm.st.(store.ClusterStore); ok {
+		enr, err := cs.ConsumeEnrollment(trimmedCode)
+		if err != nil {
+			return nil, fmt.Errorf("consume cluster enrollment code: %w", err)
+		}
+		if enr == nil {
+			return nil, ErrInvalidEnrollment
+		}
+		tenantID = enr.TenantID
+		deviceName = enr.DeviceName
+	} else {
+		dm.mu.Lock()
+		enr, ok := dm.enrollments[trimmedCode]
+		if !ok || enr.used || time.Now().UTC().After(enr.expiresAt) {
+			dm.mu.Unlock()
+			return nil, ErrInvalidEnrollment
+		}
+		// Mark single-use immediately under lock to eliminate TOCTOU replay!
+		enr.used = true
+		tenantID = enr.tenantID
+		deviceName = enr.deviceName
 		dm.mu.Unlock()
-		return nil, ErrInvalidEnrollment
 	}
-	// Mark single-use immediately under lock to eliminate TOCTOU replay!
-	enr.used = true
-	tenantID := enr.tenantID
-	deviceName := enr.deviceName
-	dm.mu.Unlock()
 
 	deviceID := "dev_" + randomHex(8)
 	deviceToken := "dpxdev_" + randomHex(24)
@@ -349,19 +390,15 @@ func (dm *DeviceManager) RenewDevice(deviceID, currentToken, csrPEM string, peer
 		return nil, err
 	}
 
-	dm.mu.RLock()
-	rec, ok := dm.devices[deviceID]
+	rec, ok := dm.lookupDeviceReadThrough(deviceID)
 	if !ok {
-		dm.mu.RUnlock()
 		return nil, ErrUnknownDevice
 	}
 	if rec.Revoked {
-		dm.mu.RUnlock()
 		return nil, ErrDeviceRevoked
 	}
 	tenantID := rec.TenantID
 	expectedHash := rec.tokenHash
-	dm.mu.RUnlock()
 
 	// Authenticate using current device token (and peer cert if present).
 	provided := sha256.Sum256([]byte(currentToken))
@@ -379,16 +416,16 @@ func (dm *DeviceManager) RenewDevice(deviceID, currentToken, csrPEM string, peer
 	}
 
 	dm.mu.Lock()
-	rec = dm.devices[deviceID]
-	if rec == nil || rec.Revoked {
+	recPtr := dm.devices[deviceID]
+	if recPtr == nil || recPtr.Revoked {
 		dm.mu.Unlock()
 		return nil, ErrDeviceRevoked
 	}
-	rec.CertSerial = serialHex
-	rec.CertExpiresAt = expiresAt
-	rec.LastRotatedAt = time.Now().UTC()
-	rec.tokenHash = sha256.Sum256([]byte(newToken))
-	copyForSave := *rec
+	recPtr.CertSerial = serialHex
+	recPtr.CertExpiresAt = expiresAt
+	recPtr.LastRotatedAt = time.Now().UTC()
+	recPtr.tokenHash = sha256.Sum256([]byte(newToken))
+	copyForSave := *recPtr
 	dm.mu.Unlock()
 	dm.persistDevice(&copyForSave)
 
@@ -405,18 +442,17 @@ func (dm *DeviceManager) RenewDevice(deviceID, currentToken, csrPEM string, peer
 
 // AuthenticateDevice verifies an enrolled agent connecting over a tunnel using its device_id,
 // device_token, and optional mTLS client certificate, rejecting revoked or expired devices.
+// When backed by a shared ClusterStore (e.g. MySQL), it reads through to the shared store
+// so new enrollments and revocations performed on any peer Hub node take effect immediately.
 func (dm *DeviceManager) AuthenticateDevice(tenantID, deviceID, deviceToken string, peerCerts []*x509.Certificate) error {
-	dm.mu.RLock()
-	rec, ok := dm.devices[deviceID]
+	rec, ok := dm.lookupDeviceReadThrough(deviceID)
 	if !ok {
-		dm.mu.RUnlock()
 		return ErrUnknownDevice
 	}
 	revoked := rec.Revoked
 	recTenant := rec.TenantID
 	exp := rec.CertExpiresAt
 	expectedHash := rec.tokenHash
-	dm.mu.RUnlock()
 
 	if revoked {
 		return ErrDeviceRevoked
@@ -437,8 +473,73 @@ func (dm *DeviceManager) AuthenticateDevice(tenantID, deviceID, deviceToken stri
 	return nil
 }
 
+// lookupDeviceReadThrough fetches the freshest device state from ClusterStore when available
+// (falling back to local memory if the store is unavailable or single-node).
+func (dm *DeviceManager) lookupDeviceReadThrough(deviceID string) (DeviceRecord, bool) {
+	if cs, ok := dm.st.(store.ClusterStore); ok {
+		if pd, err := cs.GetDevice(deviceID); err == nil {
+			if pd == nil {
+				return DeviceRecord{}, false
+			}
+			rec := persistedToDeviceRecord(*pd)
+			dm.mu.Lock()
+			dm.devices[deviceID] = rec
+			dm.mu.Unlock()
+			return *rec, true
+		}
+	}
+	dm.mu.RLock()
+	rec, ok := dm.devices[deviceID]
+	var cp DeviceRecord
+	if ok {
+		cp = *rec
+	}
+	dm.mu.RUnlock()
+	return cp, ok
+}
+
+// SyncDevices merges the latest device table from a shared ClusterStore into memory
+// and returns all revoked device IDs so the Hub can immediately evict any live sessions
+// belonging to devices revoked on peer Hub nodes.
+func (dm *DeviceManager) SyncDevices(persisted []store.PersistedDevice) (revokedIDs []string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	for _, pd := range persisted {
+		rec := persistedToDeviceRecord(pd)
+		dm.devices[pd.DeviceID] = rec
+		if rec.Revoked {
+			revokedIDs = append(revokedIDs, rec.DeviceID)
+		}
+	}
+	return revokedIDs
+}
+
+func persistedToDeviceRecord(pd store.PersistedDevice) *DeviceRecord {
+	var th [32]byte
+	if b, err := hex.DecodeString(pd.TokenHashHex); err == nil && len(b) == 32 {
+		copy(th[:], b)
+	}
+	return &DeviceRecord{
+		DeviceID:      pd.DeviceID,
+		TenantID:      pd.TenantID,
+		DeviceName:    pd.DeviceName,
+		CertSerial:    pd.CertSerial,
+		EnrolledAt:    pd.EnrolledAt,
+		CertExpiresAt: pd.CertExpiresAt,
+		LastRotatedAt: pd.LastRotatedAt,
+		Revoked:       pd.Revoked,
+		RevokedAt:     pd.RevokedAt,
+		RevokedReason: pd.RevokedReason,
+		tokenHash:     th,
+	}
+}
+
 // RevokeDevice permanently revokes a single device_id without impacting other HA devices of the same tenant.
 func (dm *DeviceManager) RevokeDevice(deviceID, reason string) (*DeviceRecord, error) {
+	// Ensure a device enrolled on another Hub node is loaded into local cache before revoking.
+	if _, ok := dm.lookupDeviceReadThrough(deviceID); !ok {
+		return nil, ErrUnknownDevice
+	}
 	dm.mu.Lock()
 	rec, ok := dm.devices[deviceID]
 	if !ok {

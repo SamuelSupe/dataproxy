@@ -48,8 +48,9 @@ type AuditLogger struct {
 	agentID  string
 	logger   *slog.Logger
 
-	fileMu sync.Mutex
-	file   *os.File
+	fileMu  sync.Mutex
+	file    *os.File
+	hasFile bool // immutable after NewAuditLogger; guards lock-free fast-path check without racing Close()
 
 	syslogNet     string
 	syslogAddr    string
@@ -80,6 +81,7 @@ func NewAuditLogger(tenantID, agentID string, cfg AuditConfig, logger *slog.Logg
 			return nil, fmt.Errorf("open audit file %q: %w", path, err)
 		}
 		al.file = f
+		al.hasFile = true
 	}
 
 	if rawSyslog := strings.TrimSpace(cfg.SyslogAddr); rawSyslog != "" {
@@ -151,7 +153,7 @@ func (al *AuditLogger) Record(ev AuditEvent) {
 		al.logger.Info("AUDIT", attrs...)
 	}
 
-	if al.file == nil && al.syslogCh == nil {
+	if !al.hasFile && al.syslogCh == nil {
 		return
 	}
 	line, err := json.Marshal(ev)
@@ -159,7 +161,7 @@ func (al *AuditLogger) Record(ev AuditEvent) {
 		return
 	}
 
-	if al.file != nil {
+	if al.hasFile {
 		al.fileMu.Lock()
 		if al.file != nil {
 			_, _ = al.file.Write(append(line, '\n'))
@@ -182,27 +184,37 @@ func (al *AuditLogger) Record(ev AuditEvent) {
 func (al *AuditLogger) syslogWorker() {
 	defer al.syslogWG.Done()
 	var conn net.Conn
+	var nextDialRetry time.Time
 	defer func() {
 		if conn != nil {
 			_ = conn.Close()
 		}
 	}()
 
-	send := func(msg string) {
+	send := func(msg string) bool {
 		if conn == nil {
+			if !nextDialRetry.IsZero() && time.Now().Before(nextDialRetry) {
+				al.droppedSyslog.Add(1)
+				return false
+			}
 			c, err := net.DialTimeout(al.syslogNet, al.syslogAddr, 1*time.Second)
 			if err != nil {
+				nextDialRetry = time.Now().Add(5 * time.Second)
 				al.droppedSyslog.Add(1)
-				return
+				return false
 			}
+			nextDialRetry = time.Time{}
 			conn = c
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		if _, err := conn.Write([]byte(msg)); err != nil {
 			_ = conn.Close()
 			conn = nil
+			nextDialRetry = time.Now().Add(5 * time.Second)
 			al.droppedSyslog.Add(1)
+			return false
 		}
+		return true
 	}
 
 	for {
@@ -210,11 +222,15 @@ func (al *AuditLogger) syslogWorker() {
 		case msg := <-al.syslogCh:
 			send(msg)
 		case <-al.syslogStopCh:
-			// Best-effort quick drain of remaining queued messages without blocking shutdown.
-			for i := 0; i < 64; i++ {
+			// Best-effort bounded drain: stop immediately on first delivery error or 1.5s budget
+			// so an unreachable SIEM server can NEVER block agent shutdown or config hot-reload.
+			deadline := time.Now().Add(1500 * time.Millisecond)
+			for i := 0; i < 64 && time.Now().Before(deadline); i++ {
 				select {
 				case msg := <-al.syslogCh:
-					send(msg)
+					if !send(msg) {
+						return
+					}
 				default:
 					return
 				}

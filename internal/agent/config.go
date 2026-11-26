@@ -47,8 +47,9 @@ type Config struct {
 
 // ServerConfig specifies how the agent dials the central hub.
 type ServerConfig struct {
-	Mode        string               `yaml:"mode"` // "wss", "tls", or "tcp" (dev)
-	URL         string               `yaml:"url"`
+	Mode        string               `yaml:"mode"`     // "wss" (default), "quic", "auto" (quic -> wss fallback), "tls", or "tcp" (dev)
+	URL         string               `yaml:"url"`      // WSS/TLS URL (also used as WSS fallback target in "auto" mode)
+	QUICURL     string               `yaml:"quic_url"` // Optional QUIC UDP host:port override (defaults to host:port from url)
 	ProxyURL    string               `yaml:"proxy_url"`
 	DialTimeout time.Duration        `yaml:"dial_timeout"`
 	TLS         transport.TLSOptions `yaml:"tls"`
@@ -309,20 +310,27 @@ func (c *Config) NormalizeAndValidate() error {
 		}
 
 		if svc.Guard != nil {
-			if svc.Protocol != protocol.ProtocolTCP {
-				return fmt.Errorf("service %q: database guard is only valid for tcp services", svc.Name)
-			}
 			svc.Guard.Type = strings.ToLower(strings.TrimSpace(svc.Guard.Type))
 			switch svc.Guard.Type {
-			case "mysql", "postgres", "postgresql", "pg", "mongodb", "mongo", "redis":
-				if svc.Guard.Type == "postgresql" || svc.Guard.Type == "pg" {
-					svc.Guard.Type = "postgres"
-				}
-				if svc.Guard.Type == "mongo" {
-					svc.Guard.Type = "mongodb"
-				}
+			case "mysql", "doris", "starrocks":
+				// Apache Doris and StarRocks speak native MySQL v10 wire protocol.
+				svc.Guard.Type = "mysql"
+			case "postgres", "postgresql", "pg":
+				svc.Guard.Type = "postgres"
+			case "mongodb", "mongo":
+				svc.Guard.Type = "mongodb"
+			case "redis":
+			case "mssql", "sqlserver":
+				svc.Guard.Type = "mssql"
+			case "oracle":
+			case "clickhouse", "ch":
+				svc.Guard.Type = "clickhouse"
 			default:
-				return fmt.Errorf("service %q: unsupported guard.type %q (expected mysql, postgres, mongodb, or redis)", svc.Name, svc.Guard.Type)
+				return fmt.Errorf("service %q: unsupported guard.type %q (expected mysql, doris, starrocks, postgres, mongodb, redis, mssql, oracle, or clickhouse)", svc.Name, svc.Guard.Type)
+			}
+
+			if svc.Protocol != protocol.ProtocolTCP && svc.Guard.Type != "clickhouse" {
+				return fmt.Errorf("service %q: database guard %q is only valid for tcp services", svc.Name, svc.Guard.Type)
 			}
 
 			if inj := svc.Guard.CredentialInjection; inj != nil && inj.Enabled {

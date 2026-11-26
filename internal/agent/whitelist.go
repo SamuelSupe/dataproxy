@@ -82,13 +82,7 @@ func (w *Whitelist) Reload(services []ServiceConfig, globalWindows *TimeWindowCh
 
 		var protoGuard guard.ProtocolGuard
 		usesStartTLS := false
-		if svc.Protocol == protocol.ProtocolHTTP {
-			protoGuard, _ = guard.BuildGuard(guard.GuardSpec{
-				Type:               "http",
-				AllowedHTTPMethods: svc.AllowedHTTPMethods,
-				InjectHeaders:      svc.InjectHeaders,
-			})
-		} else if g := svc.EffectiveGuard(); g != nil {
+		if g := svc.EffectiveGuard(); g != nil {
 			spec := guard.GuardSpec{
 				Type:      g.Type,
 				ReadOnly:  g.ReadOnly,
@@ -104,6 +98,12 @@ func (w *Whitelist) Reload(services []ServiceConfig, globalWindows *TimeWindowCh
 				spec.AuthSource = g.CredentialInjection.AuthSource
 			}
 			protoGuard, _ = guard.BuildGuard(spec)
+		} else if svc.Protocol == protocol.ProtocolHTTP {
+			protoGuard, _ = guard.BuildGuard(guard.GuardSpec{
+				Type:               "http",
+				AllowedHTTPMethods: svc.AllowedHTTPMethods,
+				InjectHeaders:      svc.InjectHeaders,
+			})
 		}
 
 		entries[svc.Name] = &WhitelistEntry{

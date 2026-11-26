@@ -238,15 +238,18 @@ func (pm *PortMapper) Close() {
 }
 
 func (pm *PortMapper) serveBinding(b *tcpBinding) {
+	var tempDelay time.Duration
 	for {
 		clientConn, err := b.ln.Accept()
 		if err != nil {
 			if b.closed.Load() || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			pm.logger.Warn("tcp binding accept error", "id", b.id, "error", err)
+			pm.logger.Warn("tcp binding accept error, backing off", "id", b.id, "error", err)
+			sleepAcceptBackoff(&tempDelay)
 			continue
 		}
+		tempDelay = 0
 
 		if !b.isAllowedRemote(clientConn.RemoteAddr()) {
 			pm.logger.Warn("AUDIT: rejected tcp connection outside allowed_cidrs",
@@ -269,7 +272,9 @@ func (pm *PortMapper) serveBinding(b *tcpBinding) {
 			}()
 
 			callerID := "tcp-binding:" + b.id + "@" + cc.RemoteAddr().String()
-			stream, err := pm.registry.OpenTenantStream(context.Background(), b.tenantID, b.serviceName, protocol.ProtocolTCP, callerID)
+			openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
+			stream, err := pm.registry.OpenTenantStream(openCtx, b.tenantID, b.serviceName, protocol.ProtocolTCP, callerID)
+			cancelOpen()
 			if err != nil {
 				pm.logger.Warn("failed opening tenant tcp stream",
 					"binding_id", b.id,

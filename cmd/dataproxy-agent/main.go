@@ -59,6 +59,7 @@ func main() {
 	// Listen for SIGHUP to trigger immediate lossless config hot-reload.
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
+	defer signal.Stop(sighupCh)
 	go func() {
 		for {
 			select {

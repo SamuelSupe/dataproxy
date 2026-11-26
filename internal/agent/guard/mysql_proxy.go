@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"dataproxy/internal/transport"
 )
@@ -180,6 +181,11 @@ func (p *MySQLProxy) Proxy(
 	clientConn, serverConn net.Conn,
 	onBlocked func(cmd byte, sql, reason string),
 ) (bytesIn, bytesOut int64, err error) {
+	// Bound the handshake phase so stalled clients or backends never leak streams indefinitely.
+	hsDeadline := time.Now().Add(15 * time.Second)
+	_ = clientConn.SetDeadline(hsDeadline)
+	_ = serverConn.SetDeadline(hsDeadline)
+
 	// 1. Read Server-First Initial Handshake Packet (seq=0) from tenant MySQL.
 	srvSeq, greeting, err := readMySQLPacket(serverConn)
 	if err != nil {
@@ -258,7 +264,7 @@ func (p *MySQLProxy) Proxy(
 			_ = writeMySQLErrPacket(clientConn, cliSeq+1, 2026, "HY000", "dataproxy-agent: TLS handshake with target MySQL failed")
 			return bytesIn, bytesOut, fmt.Errorf("mysql target TLS handshake failed: %w", err)
 		}
-		_ = tlsConn.SetDeadline(time.Time{})
+		_ = tlsConn.SetDeadline(hsDeadline)
 		serverConn = tlsConn
 
 		// After SSLRequest (seq=1), MySQL protocol mandates CLIENT_SSL set and seq=2 on HandshakeResponse41.
@@ -407,6 +413,9 @@ func (p *MySQLProxy) Proxy(
 	}
 
 CommandPhase:
+	_ = clientConn.SetDeadline(time.Time{})
+	_ = serverConn.SetDeadline(time.Time{})
+
 	// If only credential injection was enabled (not ReadOnly), switch immediately to
 	// zero-copy BidirectionalPipe for full native performance!
 	if !p.cfg.ReadOnly {
@@ -419,7 +428,11 @@ CommandPhase:
 	var serverCopyBytes atomic.Int64
 	srvDone := make(chan struct{})
 	go func() {
-		defer close(srvDone)
+		defer func() {
+			// Unblock client read loop immediately if the backend MySQL server disconnects.
+			_ = clientConn.Close()
+			close(srvDone)
+		}()
 		bufPtr := transport.GetCopyBuf()
 		defer transport.PutCopyBuf(bufPtr)
 		buf := *bufPtr
@@ -440,14 +453,29 @@ CommandPhase:
 		}
 	}()
 
+	// Reuse a single pooled 64KiB buffer across the command loop so normal queries
+	// require ZERO heap allocations and ZERO copies when forwarding raw packets to MySQL.
+	cmdBufPtr := transport.GetCopyBuf()
+	defer transport.PutCopyBuf(cmdBufPtr)
+	cmdBuf := *cmdBufPtr
+
 	for {
-		cSeq, cPayload, err := readMySQLPacket(clientConn)
+		cSeq, cPayload, rawFrame, err := readMySQLPacketReusable(clientConn, cmdBuf)
 		if err != nil {
 			break
 		}
-		bytesIn += int64(len(cPayload) + 4)
+		bytesIn += int64(len(rawFrame))
 		if len(cPayload) == 0 {
 			continue
+		}
+		// Reject 16MiB-1 split continuation packets in read-only mode so continuation
+		// payloads cannot desynchronize command-byte framing.
+		if len(cPayload) == 0xffffff {
+			p.blockedQueries.Add(1)
+			clientWriteMu.Lock()
+			_ = writeMySQLErrPacket(clientConn, cSeq+1, 1290, "HY000", "dataproxy-agent: multi-packet SQL (>16MiB) is blocked in read-only mode")
+			clientWriteMu.Unlock()
+			break
 		}
 
 		cmd := cPayload[0]
@@ -470,7 +498,7 @@ CommandPhase:
 			continue
 		}
 
-		if err := writeMySQLPacket(serverConn, cSeq, cPayload); err != nil {
+		if _, err := serverConn.Write(rawFrame); err != nil {
 			break
 		}
 		if cmd == comQuit {
@@ -491,7 +519,9 @@ func (p *MySQLProxy) checkCommandAllowed(cmd byte, body []byte) (bool, string) {
 		return true, ""
 
 	case comQuery, comStmtPrepare:
-		return IsReadOnlySQL(string(body))
+		// Zero-alloc read-only view: IsReadOnlySQL never retains references to its input string.
+		sqlView := unsafe.String(unsafe.SliceData(body), len(body))
+		return IsReadOnlySQL(sqlView)
 
 	default:
 		return false, fmt.Sprintf("MySQL command 0x%02x is blocked by tenant read-only policy", cmd)
@@ -623,16 +653,22 @@ func rewriteHandshakeResponse41(
 	}
 	pos += endUser + 1
 
-	// Skip placeholder auth response
+	// Skip placeholder auth response (using uint64 bounds checks to prevent int overflow panics).
 	switch {
 	case (caps & capClientPluginAuthLenencClientData) != 0:
 		authLen, n := readLenEncInt(orig[pos:])
+		if n == 0 || pos+n > len(orig) || authLen > uint64(len(orig)-pos-n) {
+			return nil, errors.New("truncated or oversized lenenc auth response")
+		}
 		pos += n + int(authLen)
 	case (caps & capClientSecureConnection) != 0:
 		if pos >= len(orig) {
 			return nil, errors.New("missing placeholder auth length")
 		}
 		authLen := int(orig[pos])
+		if 1+authLen > len(orig)-pos {
+			return nil, errors.New("truncated auth response")
+		}
 		pos += 1 + authLen
 	default:
 		endAuth := bytes.IndexByte(orig[pos:], 0x00)
@@ -782,6 +818,28 @@ func readLenEncInt(b []byte) (uint64, int) {
 	default:
 		return uint64(b[0]), 1
 	}
+}
+
+func readMySQLPacketReusable(r io.Reader, scratch []byte) (seq byte, payload, rawFrame []byte, err error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, nil, err
+	}
+	length := int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16
+	total := 4 + length
+	if total <= len(scratch) {
+		rawFrame = scratch[:total]
+	} else {
+		rawFrame = make([]byte, total)
+	}
+	copy(rawFrame[:4], hdr[:])
+	payload = rawFrame[4:total]
+	if length > 0 {
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return 0, nil, nil, err
+		}
+	}
+	return hdr[3], payload, rawFrame, nil
 }
 
 func readMySQLPacket(r io.Reader) (byte, []byte, error) {

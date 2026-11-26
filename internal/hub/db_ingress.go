@@ -47,14 +47,18 @@ func NewSmartDBIngress(registry *Registry, tickets *auth.TicketManager, logger *
 // ============================================================================
 
 func (s *SmartDBIngress) ServePostgres(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			s.logger.Warn("pg smart router accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go s.handlePGConn(conn)
 	}
 }
@@ -124,8 +128,9 @@ func (s *SmartDBIngress) handlePGConn(clientConn net.Conn) {
 	}
 
 	// 4. Open tenant stream carrying Job Ticket ID & Business Purpose straight to tenant Agent!
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
 	stream, err := s.registry.OpenTenantStreamWithMeta(
-		context.Background(),
+		openCtx,
 		claims.TenantID,
 		claims.ServiceName,
 		protocol.ProtocolTCP,
@@ -135,6 +140,7 @@ func (s *SmartDBIngress) handlePGConn(clientConn net.Conn) {
 			Purpose:  claims.Purpose,
 		},
 	)
+	cancelOpen()
 	if err != nil {
 		s.logger.Warn("pg smart router open stream failed", "tenant", claims.TenantID, "service", claims.ServiceName, "error", err)
 		writeHubPGError(clientConn, "08006", "dataproxy-hub: "+err.Error())
@@ -160,14 +166,18 @@ func (s *SmartDBIngress) handlePGConn(clientConn net.Conn) {
 // ============================================================================
 
 func (s *SmartDBIngress) ServeMySQL(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			s.logger.Warn("mysql smart router accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go s.handleMySQLConn(conn)
 	}
 }
@@ -229,8 +239,9 @@ func (s *SmartDBIngress) handleMySQLConn(clientConn net.Conn) {
 	}
 
 	// 3. Open tenant stream carrying Job Ticket ID & Business Purpose!
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
 	stream, err := s.registry.OpenTenantStreamWithMeta(
-		context.Background(),
+		openCtx,
 		claims.TenantID,
 		claims.ServiceName,
 		protocol.ProtocolTCP,
@@ -240,6 +251,7 @@ func (s *SmartDBIngress) handleMySQLConn(clientConn net.Conn) {
 			Purpose:  claims.Purpose,
 		},
 	)
+	cancelOpen()
 	if err != nil {
 		s.logger.Warn("mysql smart router open stream failed", "tenant", claims.TenantID, "service", claims.ServiceName, "error", err)
 		_ = writeHubMySQLErr(clientConn, cliSeq+1, 1045, "28000", "dataproxy-hub: "+err.Error())
@@ -277,14 +289,18 @@ func (s *SmartDBIngress) handleMySQLConn(clientConn net.Conn) {
 // ============================================================================
 
 func (s *SmartDBIngress) ServeRedis(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			s.logger.Warn("redis smart router accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go s.handleRedisConn(conn)
 	}
 }
@@ -347,8 +363,9 @@ func (s *SmartDBIngress) handleRedisConn(clientConn net.Conn) {
 		return
 	}
 
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
 	stream, err := s.registry.OpenTenantStreamWithMeta(
-		context.Background(),
+		openCtx,
 		claims.TenantID,
 		claims.ServiceName,
 		protocol.ProtocolTCP,
@@ -358,6 +375,7 @@ func (s *SmartDBIngress) handleRedisConn(clientConn net.Conn) {
 			Purpose:  claims.Purpose,
 		},
 	)
+	cancelOpen()
 	if err != nil {
 		s.logger.Warn("redis smart router open stream failed", "tenant", claims.TenantID, "service", claims.ServiceName, "error", err)
 		_, _ = fmt.Fprintf(clientConn, "-ERR dataproxy-hub: %v\r\n", err)
@@ -577,31 +595,60 @@ func parseHubMySQLHandshake41(orig []byte) (username string, authResp []byte, er
 	return username, authResp, nil
 }
 
+const (
+	maxHubRESPLineBytes  = 64 * 1024
+	maxHubRESPTotalBytes = 1024 * 1024
+)
+
+func readHubRESPLine(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == nil {
+		return line, nil
+	}
+	if !errors.Is(err, bufio.ErrBufferFull) {
+		return nil, err
+	}
+	var full []byte
+	full = append(full, line...)
+	for errors.Is(err, bufio.ErrBufferFull) {
+		if len(full) >= maxHubRESPLineBytes {
+			return nil, errors.New("pre-auth RESP line exceeds 64KiB limit")
+		}
+		line, err = br.ReadSlice('\n')
+		full = append(full, line...)
+	}
+	if len(full) > maxHubRESPLineBytes {
+		return nil, errors.New("pre-auth RESP line exceeds 64KiB limit")
+	}
+	return full, err
+}
+
 func readHubRESP(br *bufio.Reader) ([]string, []byte, error) {
 	first, err := br.Peek(1)
 	if err != nil {
 		return nil, nil, err
 	}
 	if first[0] != '*' {
-		line, err := br.ReadBytes('\n')
+		line, err := readHubRESPLine(br)
 		if err != nil {
 			return nil, nil, err
 		}
-		return strings.Fields(string(line)), line, nil
+		cp := append([]byte(nil), line...)
+		return strings.Fields(string(cp)), cp, nil
 	}
 	var raw bytes.Buffer
-	hdrLine, err := br.ReadBytes('\n')
+	hdrLine, err := readHubRESPLine(br)
 	if err != nil {
 		return nil, nil, err
 	}
 	raw.Write(hdrLine)
 	count, err := strconv.Atoi(strings.TrimSpace(string(hdrLine[1:])))
-	if err != nil || count < 0 || count > 1000 {
-		return nil, nil, errors.New("invalid RESP array")
+	if err != nil || count < 0 || count > 64 {
+		return nil, nil, errors.New("invalid pre-auth RESP array")
 	}
 	args := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		lenLine, err := br.ReadBytes('\n')
+		lenLine, err := readHubRESPLine(br)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -610,8 +657,8 @@ func readHubRESP(br *bufio.Reader) ([]string, []byte, error) {
 			return nil, nil, errors.New("expected bulk string")
 		}
 		bLen, err := strconv.Atoi(strings.TrimSpace(string(lenLine[1:])))
-		if err != nil || bLen < 0 || bLen > 64*1024 {
-			return nil, nil, errors.New("invalid bulk len")
+		if err != nil || bLen < 0 || bLen > 64*1024 || raw.Len()+bLen+2 > maxHubRESPTotalBytes {
+			return nil, nil, errors.New("invalid pre-auth bulk len")
 		}
 		buf := make([]byte, bLen+2)
 		if _, err := io.ReadFull(br, buf); err != nil {

@@ -17,10 +17,11 @@ type Config struct {
 	LogLevel string `yaml:"log_level"`
 
 	// Tunnel listeners (agent -> hub).
-	TunnelWSSAddr string               `yaml:"tunnel_wss_addr"` // e.g. ":8443"
-	TunnelWSSPath string               `yaml:"tunnel_wss_path"` // default "/tunnel/v1/connect"
-	TunnelTLSAddr string               `yaml:"tunnel_tls_addr"` // optional raw mTLS/TLS TCP listener, e.g. ":9443"
-	TunnelTLS     transport.TLSOptions `yaml:"tunnel_tls"`
+	TunnelWSSAddr  string               `yaml:"tunnel_wss_addr"`  // e.g. ":8443" (TCP)
+	TunnelWSSPath  string               `yaml:"tunnel_wss_path"`  // default "/tunnel/v1/connect"
+	TunnelQUICAddr string               `yaml:"tunnel_quic_addr"` // optional native QUIC listener (UDP), e.g. ":8443"
+	TunnelTLSAddr  string               `yaml:"tunnel_tls_addr"`  // optional raw mTLS/TLS TCP listener, e.g. ":9443"
+	TunnelTLS      transport.TLSOptions `yaml:"tunnel_tls"`
 
 	// Central platform ingress listeners (central callers -> hub).
 	ProxyAddr           string `yaml:"proxy_addr"`            // Unified SOCKS5 + HTTP CONNECT listener, e.g. "127.0.0.1:1080"
@@ -32,8 +33,10 @@ type Config struct {
 	VirtualDomainSuffix string `yaml:"virtual_domain_suffix"` // e.g. "dataproxy.internal"
 
 	// Control plane, persistence, cluster mesh, short-lived job tickets, and device PKI.
-	StateFile          string        `yaml:"state_file"`          // Optional crash-safe JSON control-plane state file
-	NodeID             string        `yaml:"node_id"`             // Optional node identifier in multi-node hub cluster
+	StateFile         string        `yaml:"state_file"`          // Optional crash-safe JSON control-plane state file (single-node)
+	StoreMySQLDSN     string        `yaml:"store_mysql_dsn"`     // Optional shared MySQL DSN for 3+ node HA Hub cluster state & revocation sync
+	StoreSyncInterval time.Duration `yaml:"store_sync_interval"` // Cluster state/revocation sync interval against MySQL (default 2s)
+	NodeID            string        `yaml:"node_id"`             // Optional node identifier in multi-node hub cluster
 	MeshListenAddr     string        `yaml:"mesh_listen_addr"`    // Optional Hub-to-Hub peer forwarding listener, e.g. ":7946"
 	MeshSecret         string        `yaml:"mesh_secret"`         // Shared secret authenticating Hub-to-Hub mesh forwarding
 	MeshPeers          []string      `yaml:"mesh_peers"`          // Peer Hub mesh addresses for transparent cross-node routing
@@ -99,5 +102,8 @@ func (c *Config) Normalize() {
 	}
 	if c.StreamOpenTimeout <= 0 {
 		c.StreamOpenTimeout = 10 * time.Second
+	}
+	if c.StoreSyncInterval <= 0 {
+		c.StoreSyncInterval = 2 * time.Second
 	}
 }

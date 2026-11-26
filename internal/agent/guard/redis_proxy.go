@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -171,15 +170,18 @@ func (p *RedisProxy) Proxy(
 			} else {
 				authArgs = []string{"AUTH", realPass}
 			}
+			_ = serverConn.SetDeadline(time.Now().Add(15 * time.Second))
 			if _, err := serverConn.Write(encodeRESPArray(authArgs)); err != nil {
 				return 0, 0, fmt.Errorf("send proactive redis AUTH: %w", err)
 			}
 			srvBR := transport.GetBufioReader(serverConn)
 			defer transport.PutBufioReader(srvBR)
-			line, err := srvBR.ReadString('\n')
+			lineBytes, err := readRESPLine(srvBR)
 			if err != nil {
 				return 0, 0, fmt.Errorf("read proactive redis AUTH reply: %w", err)
 			}
+			_ = serverConn.SetDeadline(time.Time{})
+			line := string(lineBytes)
 			if !strings.HasPrefix(line, "+OK") {
 				_, _ = io.WriteString(clientConn, "-ERR dataproxy-agent: local redis credential authentication failed\r\n")
 				return 0, 0, fmt.Errorf("redis local AUTH failed: %s", strings.TrimSpace(line))
@@ -203,7 +205,11 @@ func (p *RedisProxy) Proxy(
 	var serverCopyBytes atomic.Int64
 	srvDone := make(chan struct{})
 	go func() {
-		defer close(srvDone)
+		defer func() {
+			// Unblock client read loop immediately if the backend Redis server disconnects.
+			_ = clientConn.Close()
+			close(srvDone)
+		}()
 		bufPtr := transport.GetCopyBuf()
 		defer transport.PutCopyBuf(bufPtr)
 		buf := *bufPtr
@@ -226,8 +232,9 @@ func (p *RedisProxy) Proxy(
 
 	cliBR := transport.GetBufioReader(clientConn)
 	defer transport.PutBufioReader(cliBR)
+	var cmdReader respCmdReader
 	for {
-		args, raw, err := readRESPCommand(cliBR)
+		args, raw, err := cmdReader.read(cliBR)
 		if err != nil {
 			break
 		}
@@ -307,51 +314,141 @@ func encodeRESPArray(args []string) []byte {
 	return b.Bytes()
 }
 
-func readRESPCommand(br *bufio.Reader) ([]string, []byte, error) {
+const (
+	maxRESPLineBytes      = 64 * 1024
+	maxRESPCommandBytes   = 64 * 1024 * 1024
+	maxRESPReusableRawCap = 256 * 1024
+)
+
+// respCmdReader reuses raw byte and arg buffers across commands on a Redis connection
+// to minimize per-command heap allocations on high-QPS Redis workloads.
+type respCmdReader struct {
+	raw  []byte
+	args []string
+}
+
+func (rr *respCmdReader) read(br *bufio.Reader) ([]string, []byte, error) {
 	first, err := br.Peek(1)
 	if err != nil {
 		return nil, nil, err
 	}
+	if cap(rr.raw) > maxRESPReusableRawCap {
+		rr.raw = nil
+	} else {
+		rr.raw = rr.raw[:0]
+	}
+	rr.args = rr.args[:0]
 	if first[0] != '*' {
-		// Inline command (e.g. "PING\r\n")
-		line, err := br.ReadBytes('\n')
+		// Inline command (e.g. "PING\r\n") bounded to maxRESPLineBytes.
+		line, err := readRESPLine(br)
 		if err != nil {
 			return nil, nil, err
 		}
-		fields := strings.Fields(string(line))
-		return fields, line, nil
+		rr.raw = append(rr.raw, line...)
+		return strings.Fields(string(rr.raw)), rr.raw, nil
 	}
 
-	var raw bytes.Buffer
-	hdrLine, err := br.ReadBytes('\n')
+	hdrLine, err := readRESPLine(br)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw.Write(hdrLine)
-	count, err := strconv.Atoi(strings.TrimSpace(string(hdrLine[1:])))
+	rr.raw = append(rr.raw, hdrLine...)
+	count, err := parseRESPInt(hdrLine[1:])
 	if err != nil || count < 0 || count > 100000 {
 		return nil, nil, errors.New("invalid RESP array length")
 	}
-	args := make([]string, 0, count)
+	if cap(rr.args) < count {
+		rr.args = make([]string, 0, count)
+	}
 	for i := 0; i < count; i++ {
-		lenLine, err := br.ReadBytes('\n')
+		lenLine, err := readRESPLine(br)
 		if err != nil {
 			return nil, nil, err
 		}
-		raw.Write(lenLine)
+		rr.raw = append(rr.raw, lenLine...)
 		if len(lenLine) < 2 || lenLine[0] != '$' {
 			return nil, nil, errors.New("expected RESP bulk string")
 		}
-		bulkLen, err := strconv.Atoi(strings.TrimSpace(string(lenLine[1:])))
-		if err != nil || bulkLen < 0 || bulkLen > 64*1024*1024 {
+		bulkLen, err := parseRESPInt(lenLine[1:])
+		if err != nil || bulkLen < 0 || bulkLen > maxRESPCommandBytes {
 			return nil, nil, errors.New("invalid RESP bulk string length")
 		}
-		buf := make([]byte, bulkLen+2) // payload + \r\n
-		if _, err := io.ReadFull(br, buf); err != nil {
+		need := bulkLen + 2 // payload + \r\n
+		start := len(rr.raw)
+		if start+need > maxRESPCommandBytes {
+			return nil, nil, errors.New("RESP command exceeds 64MiB safety limit")
+		}
+		if cap(rr.raw) < start+need {
+			grown := make([]byte, start+need, max(cap(rr.raw)*2, start+need))
+			copy(grown, rr.raw)
+			rr.raw = grown
+		} else {
+			rr.raw = rr.raw[:start+need]
+		}
+		if _, err := io.ReadFull(br, rr.raw[start:start+need]); err != nil {
 			return nil, nil, err
 		}
-		raw.Write(buf)
-		args = append(args, string(buf[:bulkLen]))
+		rr.args = append(rr.args, string(rr.raw[start:start+bulkLen]))
 	}
-	return args, raw.Bytes(), nil
+	return rr.args, rr.raw, nil
+}
+
+func readRESPLine(br *bufio.Reader) ([]byte, error) {
+	line, err := br.ReadSlice('\n')
+	if err == nil {
+		return line, nil
+	}
+	if !errors.Is(err, bufio.ErrBufferFull) {
+		return nil, err
+	}
+	var full []byte
+	full = append(full, line...)
+	for errors.Is(err, bufio.ErrBufferFull) {
+		if len(full) >= maxRESPLineBytes {
+			return nil, errors.New("RESP line exceeds 64KiB safety limit")
+		}
+		line, err = br.ReadSlice('\n')
+		full = append(full, line...)
+	}
+	if len(full) > maxRESPLineBytes {
+		return nil, errors.New("RESP line exceeds 64KiB safety limit")
+	}
+	return full, err
+}
+
+func parseRESPInt(b []byte) (int, error) {
+	// Trim trailing \r\n and leading/trailing spaces without allocating a string.
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r' || b[len(b)-1] == ' ') {
+		b = b[:len(b)-1]
+	}
+	if len(b) == 0 {
+		return 0, errors.New("empty int")
+	}
+	neg := false
+	if b[0] == '-' {
+		neg = true
+		b = b[1:]
+	}
+	if len(b) == 0 {
+		return 0, errors.New("empty int")
+	}
+	n := 0
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, errors.New("non-digit")
+		}
+		n = n*10 + int(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
+func readRESPCommand(br *bufio.Reader) ([]string, []byte, error) {
+	var rr respCmdReader
+	return rr.read(br)
 }

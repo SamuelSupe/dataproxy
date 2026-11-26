@@ -129,6 +129,42 @@ func probeOneServiceSanitized(svc ServiceConfig, nowUnix int64) protocol.Service
 					st.Message = fmt.Sprintf("正常 (Redis, 需认证=%v%s)", info.AuthRequired, tlsNote)
 				}
 
+			case "mssql":
+				info, err := guard.ProbeMSSQLTLS(svc.TargetAddr, 2*time.Second, tlsCfg)
+				if err != nil {
+					st.Healthy = false
+					st.Message = sanitizeProbeError("SQL Server", err)
+				} else {
+					st.Healthy = true
+					st.LatencyMs = info.Latency.Milliseconds()
+					st.ServerVersion = info.ServerVersion
+					st.Message = fmt.Sprintf("正常 (SQL Server TDS %s)", info.ServerVersion)
+				}
+
+			case "oracle":
+				info, err := guard.ProbeOracleTLS(svc.TargetAddr, 2*time.Second, tlsCfg)
+				if err != nil {
+					st.Healthy = false
+					st.Message = sanitizeProbeError("Oracle", err)
+				} else {
+					st.Healthy = true
+					st.LatencyMs = info.Latency.Milliseconds()
+					st.ServerVersion = fmt.Sprintf("TNS-v%d", info.TNSVersion)
+					st.Message = fmt.Sprintf("正常 (Oracle TNS v%d)", info.TNSVersion)
+				}
+
+			case "clickhouse":
+				info, err := guard.ProbeClickHouseTLS(svc.TargetAddr, 2*time.Second, tlsCfg)
+				if err != nil {
+					st.Healthy = false
+					st.Message = sanitizeProbeError("ClickHouse", err)
+				} else {
+					st.Healthy = true
+					st.LatencyMs = info.Latency.Milliseconds()
+					st.ServerVersion = info.Interface
+					st.Message = fmt.Sprintf("正常 (ClickHouse %s, %s)", info.Interface, info.Detail)
+				}
+
 			default:
 				start := time.Now()
 				var c net.Conn
@@ -155,12 +191,14 @@ func probeOneServiceSanitized(svc ServiceConfig, nowUnix int64) protocol.Service
 		} else {
 			start := time.Now()
 			scheme := "http"
-			httpCli := &http.Client{Timeout: 2 * time.Second}
+			tr := &http.Transport{DisableKeepAlives: true}
 			if tlsCfg != nil {
 				scheme = "https"
-				httpCli.Transport = &http.Transport{TLSClientConfig: tlsCfg.Clone()}
+				tr.TLSClientConfig = tlsCfg.Clone()
 			}
+			httpCli := &http.Client{Timeout: 2 * time.Second, Transport: tr}
 			resp, err := httpCli.Head(scheme + "://" + svc.TargetAddr + "/")
+			tr.CloseIdleConnections()
 			if err != nil {
 				// Fallback to TCP/TLS reachability if HEAD / is rejected.
 				var c net.Conn

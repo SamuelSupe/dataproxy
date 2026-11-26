@@ -1,9 +1,10 @@
 log_level: "info"
 
 # Agent -> Hub 隧道接入监听
-tunnel_wss_addr: ":8443"
+tunnel_wss_addr: ":8443"   # TCP WSS 隧道（默认推荐，443/8443 兼容正向代理与企业防火墙）
 tunnel_wss_path: "/tunnel/v1/connect"
-tunnel_tls_addr: ":9443" # 可选：原生 mTLS/TLS TCP 隧道端口
+tunnel_quic_addr: ":8443"  # 可选：原生 QUIC 隧道（UDP，可与 TCP WSS 共用同一端口号，弱网零队头阻塞）
+tunnel_tls_addr: ":9443"   # 可选：原生 mTLS/TLS TCP 隧道端口
 
 tunnel_tls:
   cert_file: "./certs/hub.crt"
@@ -21,7 +22,9 @@ redis_smart_addr: "127.0.0.1:16379"      # 单端口多租户 Redis 智能票据
 virtual_domain_suffix: "dataproxy.internal"
 
 # 管控、持久化、集群 Mesh、观测、短效票据与设备 PKI（一次性挂载码 + 短期设备证书签发）
-state_file: "./data/hub-state.json"      # 控制面崩溃安全持久化（设备 CA/已注册设备/吊销黑名单/动态租户与端口绑定）
+state_file: "./data/hub-state.json"      # 单机模式：控制面崩溃安全本地文件持久化
+store_mysql_dsn: ""                      # 多节点 HA 集群模式（优先于 state_file）：共享 MySQL 实时同步设备表/吊销黑名单/一次性挂载码/动态租户，例如 "dataproxy:secret@tcp(10.0.0.10:3306)/dataproxy?parseTime=true"
+store_sync_interval: 2s                  # 多节点集群从共享 MySQL 同步吊销黑名单与租户状态的周期（默认 2s）
 node_id: "hub-node-1"                    # 多节点高可用 Hub 集群节点标识
 mesh_listen_addr: ""                     # 可选：集群内 Hub-to-Hub 透明转发监听，如 ":7946"
 mesh_secret: ""                          # 集群内部 Mesh 鉴权密钥（多节点一致）

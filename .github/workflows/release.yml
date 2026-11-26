@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run verification suite
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Build multi-platform release archives
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64" "windows amd64"; do
+            set -- $target
+            os=$1
+            arch=$2
+            ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+            pkg="dataproxy_${TAG}_${os}_${arch}"
+            stage="dist/${pkg}"
+            mkdir -p "${stage}/configs"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "${stage}/dataproxy-hub${ext}" ./cmd/dataproxy-hub
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "${stage}/dataproxy-agent${ext}" ./cmd/dataproxy-agent
+            cp configs/hub.example.yaml configs/agent.example.yaml "${stage}/configs/"
+            cp README.md README.zh-CN.md LICENSE "${stage}/"
+            if [ "$os" = "windows" ]; then
+              (cd dist && zip -qr "${pkg}.zip" "${pkg}")
+            else
+              tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+            fi
+            rm -rf "${stage}"
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        if: steps.check_release.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

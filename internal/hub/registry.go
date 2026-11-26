@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,9 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"dataproxy/internal/transport"
 	"dataproxy/pkg/protocol"
-
-	"github.com/hashicorp/yamux"
 )
 
 var (
@@ -56,7 +56,7 @@ type AgentSession struct {
 	PoolLane    int
 	Role        string // "all", "control", or "data"
 	RemoteAddr  string
-	Transport   string // "wss" or "tls" or "tcp"
+	Transport   string // "wss", "quic", "tls", or "tcp"
 	ConnectedAt time.Time
 	Labels      map[string]string
 
@@ -64,15 +64,41 @@ type AgentSession struct {
 	Services      map[string]protocol.ServiceAnnouncement
 	ServiceHealth []protocol.ServiceHealthStatus
 
-	mux *yamux.Session
+	mux transport.StreamMux
 
-	draining      atomic.Bool
-	activeStreams atomic.Int64
-	totalStreams  atomic.Int64
-	bytesIn       atomic.Int64 // bytes from central caller -> tenant
-	bytesOut      atomic.Int64 // bytes from tenant -> central caller
-	lastSeenUnix  atomic.Int64
-	lastRTTMicros atomic.Int64
+	draining       atomic.Bool
+	activeStreams  atomic.Int64
+	totalStreams   atomic.Int64
+	bytesIn        atomic.Int64 // bytes from central caller -> tenant
+	bytesOut       atomic.Int64 // bytes from tenant -> central caller
+	lastSeenUnix   atomic.Int64
+	lastRTTMicros  atomic.Int64
+	openFailCount  atomic.Int32
+	openFailAtUnix atomic.Int64
+}
+
+func (s *AgentSession) isRecentlyDegraded(nowUnix int64) bool {
+	return s.openFailCount.Load() > 0 && nowUnix-s.openFailAtUnix.Load() < 15
+}
+
+func (s *AgentSession) recordOpenSuccess() {
+	if s.openFailCount.Load() != 0 {
+		s.openFailCount.Store(0)
+	}
+}
+
+func (s *AgentSession) recordOpenTransportFailure() {
+	n := s.openFailCount.Add(1)
+	s.openFailAtUnix.Store(time.Now().Unix())
+	// After 3 consecutive transport-level stream open failures, asynchronously verify
+	// session liveness and close a blackholed mux instead of waiting for full heartbeat expiry.
+	if n == 3 {
+		go func(sess *AgentSession) {
+			if _, err := sess.mux.Ping(); err != nil {
+				_ = sess.Close()
+			}
+		}(s)
+	}
 }
 
 // MarkDraining prevents new streams from being scheduled onto this session.
@@ -121,6 +147,7 @@ func (s *AgentSession) HasService(serviceName, reqProto string) bool {
 // RecordHeartbeat updates last-seen timestamp and optional RTT sample.
 func (s *AgentSession) RecordHeartbeat(rtt time.Duration) {
 	s.lastSeenUnix.Store(time.Now().Unix())
+	s.recordOpenSuccess()
 	if rtt > 0 {
 		s.lastRTTMicros.Store(rtt.Microseconds())
 	}
@@ -362,33 +389,32 @@ func (r *Registry) openTenantStreamInternal(
 		}
 	}()
 
+	candidates, hasAnySession := r.selectCandidates(tenantID, serviceName, proto, false)
+	canMesh := allowMesh && mesh != nil && mesh.HasPeers()
+	if (!hasAnySession || len(candidates) == 0) && !canMesh {
+		if !hasAnySession {
+			return nil, fmt.Errorf("%w: %s", ErrTenantOffline, tenantID)
+		}
+		return nil, fmt.Errorf("%w: tenant=%s service=%s proto=%s", ErrServiceNotFound, tenantID, serviceName, proto)
+	}
+
 	slot, err := r.acquireTenantStreamSlot(tenantID, metrics)
 	if err != nil {
 		return nil, err
 	}
 
-	candidates, hasAnySession := r.selectCandidates(tenantID, serviceName, proto, false)
 	if !hasAnySession || len(candidates) == 0 {
-		if allowMesh && mesh != nil && mesh.HasPeers() {
-			conn, meshErr := mesh.ForwardStream(ctx, tenantID, serviceName, proto, meta)
-			if meshErr == nil {
-				if slot != nil {
-					return &quotaTrackedConn{Conn: conn, slot: slot}, nil
-				}
-				return conn, nil
-			}
+		conn, meshErr := mesh.ForwardStream(ctx, tenantID, serviceName, proto, meta)
+		if meshErr == nil {
 			if slot != nil {
-				slot.Add(-1)
+				return &quotaTrackedConn{Conn: conn, slot: slot}, nil
 			}
-			return nil, meshErr
+			return conn, nil
 		}
 		if slot != nil {
 			slot.Add(-1)
 		}
-		if !hasAnySession {
-			return nil, fmt.Errorf("%w: %s", ErrTenantOffline, tenantID)
-		}
-		return nil, fmt.Errorf("%w: tenant=%s service=%s proto=%s", ErrServiceNotFound, tenantID, serviceName, proto)
+		return nil, meshErr
 	}
 
 	conn, err := r.dialCandidates(ctx, candidates, serviceName, proto, meta)
@@ -418,6 +444,14 @@ func (r *Registry) acquireTenantStreamSlot(tenantID string, metrics *Metrics) (*
 		r.mu.Lock()
 		counter = r.tenantActiveStreams[tenantID]
 		if counter == nil {
+			// Prune idle zero-count tenant entries when map grows large to bound memory under churn.
+			if len(r.tenantActiveStreams) >= 4096 {
+				for tid, c := range r.tenantActiveStreams {
+					if c.Load() == 0 {
+						delete(r.tenantActiveStreams, tid)
+					}
+				}
+			}
 			counter = &atomic.Int64{}
 			r.tenantActiveStreams[tenantID] = counter
 		}
@@ -443,6 +477,13 @@ type quotaTrackedConn struct {
 	net.Conn
 	slot      *atomic.Int64
 	closeOnce sync.Once
+}
+
+func (q *quotaTrackedConn) CloseWrite() error {
+	if cw, ok := q.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return q.Close()
 }
 
 func (q *quotaTrackedConn) Close() error {
@@ -486,33 +527,65 @@ func (r *Registry) selectCandidates(tenantID, serviceName, proto string, ignoreS
 	}
 	r.mu.RUnlock()
 
-	// Control/Data plane separation: when dedicated "data" (or "all") lanes are healthy,
-	// keep "control"-only lanes reserved for heartbeats and health probes.
+	// Control/Data plane separation: filter in-place to keep dedicated "data"/"all" lanes
+	// preferred over "control"-only lanes without allocating a second slice.
 	if len(candidates) > 1 {
-		dataLanes := make([]*AgentSession, 0, len(candidates))
+		nData := 0
 		for _, s := range candidates {
 			if s.Role != "control" {
-				dataLanes = append(dataLanes, s)
+				nData++
 			}
 		}
-		if len(dataLanes) > 0 {
-			candidates = dataLanes
+		if nData > 0 && nData < len(candidates) {
+			w := 0
+			for _, s := range candidates {
+				if s.Role != "control" {
+					candidates[w] = s
+					w++
+				}
+			}
+			candidates = candidates[:w]
 		}
 	}
 
 	if len(candidates) > 1 {
-		// Sort by least active streams, with round-robin tie-breaker.
-		offset := int(r.rrCounter.Add(1)) % len(candidates)
-		rotated := make([]*AgentSession, len(candidates))
-		for i := range candidates {
-			rotated[i] = candidates[(i+offset)%len(candidates)]
+		// In-place round-robin rotation + stable insertion sort placing healthy sessions
+		// strictly ahead of recently failed (potentially blackholed) sessions, then by least active streams.
+		n := len(candidates)
+		offset := int(r.rrCounter.Add(1)) % n
+		if offset > 0 {
+			reverseSessions(candidates[:offset])
+			reverseSessions(candidates[offset:])
+			reverseSessions(candidates)
 		}
-		sort.SliceStable(rotated, func(i, j int) bool {
-			return rotated[i].activeStreams.Load() < rotated[j].activeStreams.Load()
-		})
-		candidates = rotated
+		nowUnix := time.Now().Unix()
+		for i := 1; i < n; i++ {
+			cur := candidates[i]
+			curDeg := cur.isRecentlyDegraded(nowUnix)
+			curLoad := cur.activeStreams.Load()
+			j := i - 1
+			for j >= 0 {
+				jDeg := candidates[j].isRecentlyDegraded(nowUnix)
+				if jDeg == curDeg {
+					if candidates[j].activeStreams.Load() <= curLoad {
+						break
+					}
+				} else if !jDeg && curDeg {
+					break
+				}
+				candidates[j+1] = candidates[j]
+				j--
+			}
+			candidates[j+1] = cur
+		}
 	}
 	return candidates, true
+}
+
+func reverseSessions(s []*AgentSession) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
 }
 
 func (r *Registry) dialCandidates(
@@ -525,13 +598,16 @@ func (r *Registry) dialCandidates(
 	for _, sess := range candidates {
 		conn, err := r.openStreamOnSession(ctx, sess, serviceName, proto, meta)
 		if err == nil {
+			sess.recordOpenSuccess()
 			return conn, nil
 		}
 		lastErr = err
 		if errors.Is(err, ErrStreamRejected) {
+			sess.recordOpenSuccess()
 			r.rejectedStreams.Add(1)
 			return nil, err
 		}
+		sess.recordOpenTransportFailure()
 	}
 	return nil, lastErr
 }
@@ -542,19 +618,21 @@ func (r *Registry) openStreamOnSession(
 	serviceName, proto string,
 	meta StreamMeta,
 ) (net.Conn, error) {
-	stream, err := sess.mux.OpenStream()
-	if err != nil {
-		return nil, fmt.Errorf("open yamux stream on session %s: %w", sess.SessionID, err)
-	}
-
 	deadline := time.Now().Add(r.streamOpenTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
+	openCtx, cancelOpen := context.WithDeadline(ctx, deadline)
+	defer cancelOpen()
+
+	stream, err := sess.mux.OpenStreamContext(openCtx)
+	if err != nil {
+		return nil, fmt.Errorf("open stream on session %s: %w", sess.SessionID, err)
+	}
 	_ = stream.SetDeadline(deadline)
 
 	req := protocol.StreamOpenRequest{
-		TraceID:        newShortID(),
+		TraceID:        newTraceID(),
 		Traceparent:    meta.Traceparent,
 		ServiceName:    serviceName,
 		Protocol:       proto,
@@ -582,14 +660,9 @@ func (r *Registry) openStreamOnSession(
 	sess.activeStreams.Add(1)
 	sess.totalStreams.Add(1)
 	return &trackedStreamConn{
-		Conn: sessStreamConn{stream},
+		Conn: stream,
 		sess: sess,
 	}, nil
-}
-
-// sessStreamConn preserves net.Conn methods while avoiding embedding name clashes.
-type sessStreamConn struct {
-	*yamux.Stream
 }
 
 type trackedStreamConn struct {
@@ -612,6 +685,13 @@ func (t *trackedStreamConn) Write(p []byte) (int, error) {
 		t.sess.bytesIn.Add(int64(n))
 	}
 	return n, err
+}
+
+func (t *trackedStreamConn) CloseWrite() error {
+	if cw, ok := t.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return t.Close()
 }
 
 func (t *trackedStreamConn) Close() error {
@@ -673,6 +753,27 @@ func (r *Registry) Snapshot() []TenantSnapshot {
 // RejectedStreams returns total streams rejected by agents.
 func (r *Registry) RejectedStreams() int64 {
 	return r.rejectedStreams.Load()
+}
+
+var (
+	tracePrefix = initTracePrefix()
+	traceSeq    atomic.Uint32
+)
+
+func initTracePrefix() [4]byte {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return b
+}
+
+// newTraceID generates a fast, unique 16-hex-char trace ID without per-stream OS CSPRNG syscalls.
+func newTraceID() string {
+	var raw [8]byte
+	copy(raw[0:4], tracePrefix[:])
+	binary.BigEndian.PutUint32(raw[4:8], traceSeq.Add(1))
+	var dst [16]byte
+	hex.Encode(dst[:], raw[:])
+	return string(dst[:])
 }
 
 func newShortID() string {

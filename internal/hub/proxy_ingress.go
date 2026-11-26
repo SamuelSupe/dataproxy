@@ -41,14 +41,18 @@ func NewProxyIngress(registry *Registry, acl *auth.CallerACL, domainSuffix strin
 
 // Serve accepts incoming connections on ln until ln is closed.
 func (p *ProxyIngress) Serve(ln net.Listener) error {
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			p.logger.Warn("proxy ingress accept error, backing off", "error", err)
+			sleepAcceptBackoff(&tempDelay)
+			continue
 		}
+		tempDelay = 0
 		go p.handleConn(conn)
 	}
 }
@@ -218,7 +222,9 @@ func (p *ProxyIngress) handleSOCKS5(conn *bufferedConn) {
 		return
 	}
 
-	stream, err := p.registry.OpenTenantStream(context.Background(), tenantID, serviceName, protocol.ProtocolTCP, callerID)
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
+	stream, err := p.registry.OpenTenantStream(openCtx, tenantID, serviceName, protocol.ProtocolTCP, callerID)
+	cancelOpen()
 	if err != nil {
 		p.logger.Warn("socks5 open tenant stream failed",
 			"caller", callerID,
@@ -281,7 +287,9 @@ func (p *ProxyIngress) handleHTTPConnect(conn *bufferedConn) {
 		return
 	}
 
-	stream, err := p.registry.OpenTenantStream(context.Background(), tenantID, serviceName, protocol.ProtocolTCP, callerID)
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 15*time.Second)
+	stream, err := p.registry.OpenTenantStream(openCtx, tenantID, serviceName, protocol.ProtocolTCP, callerID)
+	cancelOpen()
 	if err != nil {
 		p.logger.Warn("http connect open tenant stream failed",
 			"caller", callerID,

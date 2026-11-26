@@ -55,10 +55,8 @@ func NewCallerACL(policies []CallerPolicy, allowNoAuth bool) (*CallerACL, error)
 	return acl, nil
 }
 
-// AllowNoAuth reports whether unauthenticated callers are permitted (dev mode only).
+// AllowNoAuth reports whether unauthenticated callers are permitted (immutable after init).
 func (c *CallerACL) AllowNoAuth() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	return c.allowNoAuth
 }
 
@@ -98,6 +96,11 @@ func (c *CallerACL) Upsert(p CallerPolicy) error {
 	}
 
 	c.mu.Lock()
+	if prev, exists := c.callers[id]; exists && prev.secretHash != hash {
+		if c.bearerToIDMap[prev.secretHash] == id {
+			delete(c.bearerToIDMap, prev.secretHash)
+		}
+	}
 	c.callers[id] = entry
 	c.bearerToIDMap[hash] = id
 	c.mu.Unlock()

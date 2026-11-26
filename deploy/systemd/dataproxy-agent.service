@@ -1,0 +1,20 @@
+[Unit]
+Description=dataproxy-agent Zero-Trust Tenant Data Connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dataproxy
+Group=dataproxy
+ExecStart=/usr/local/bin/dataproxy-agent -config /etc/dataproxy/agent.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dataproxy /var/log/dataproxy
+
+[Install]
+WantedBy=multi-user.target

@@ -89,13 +89,25 @@ func (g *HTTPMethodGuard) Proxy(
 			if onBlocked != nil {
 				onBlocked(req.Method, req.URL.Path)
 			}
-			nDrained, _ := io.Copy(io.Discard, req.Body)
-			_ = req.Body.Close()
-			bytesIn += nDrained
+			// Only drain small known-length bodies (<= 64 KiB) to preserve HTTP/1.1 keep-alive.
+			// For large or chunked/streaming blocked requests, skip draining and req.Body.Close()
+			// (whose stdlib implementation attempts to drain unread body bytes) and immediately
+			// return 403 Forbidden with Connection: close so huge blocked POSTs never stall the stream.
+			const maxBlockedDrain = 64 * 1024
+			forceClose := req.Close || req.ContentLength < 0 || req.ContentLength > maxBlockedDrain
+			if !forceClose && req.ContentLength > 0 {
+				nDrained, derr := io.Copy(io.Discard, io.LimitReader(req.Body, maxBlockedDrain+1))
+				bytesIn += nDrained
+				if derr != nil || nDrained > maxBlockedDrain {
+					forceClose = true
+				} else {
+					_ = req.Body.Close()
+				}
+			}
 
 			body := fmt.Sprintf("dataproxy-agent: HTTP method %s is blocked by tenant read-only policy\n", req.Method)
 			connHdr := "keep-alive"
-			if req.Close {
+			if forceClose {
 				connHdr = "close"
 			}
 			respStr := fmt.Sprintf(
@@ -104,7 +116,8 @@ func (g *HTTPMethodGuard) Proxy(
 			)
 			nWritten, werr := io.WriteString(clientConn, respStr)
 			bytesOut += int64(nWritten)
-			if werr != nil || req.Close {
+			if werr != nil || forceClose {
+				_ = clientConn.Close()
 				return bytesIn, bytesOut
 			}
 			continue
@@ -179,4 +192,11 @@ type peekedConn struct {
 
 func (p *peekedConn) Read(b []byte) (int, error) {
 	return p.r.Read(b)
+}
+
+func (p *peekedConn) CloseWrite() error {
+	if cw, ok := p.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.Close()
 }

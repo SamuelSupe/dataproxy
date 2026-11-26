@@ -1,0 +1,19 @@
+[Unit]
+Description=dataproxy-hub Multi-Tenant Secure Reverse Proxy & Control Plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dataproxy
+Group=dataproxy
+ExecStart=/usr/local/bin/dataproxy-hub -config /etc/dataproxy/hub.yaml
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dataproxy /var/log/dataproxy
+
+[Install]
+WantedBy=multi-user.target
